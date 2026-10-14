@@ -27,6 +27,7 @@ from parameterized import parameterized
 from torch import nn
 
 from tzrec.modules.gr.onerank_tokenizer import (
+    OneRankGroupMixer,
     OneRankHSTUTransducer,
     OneRankSTULayer,
     OneRankTokenizer,
@@ -37,6 +38,7 @@ from tzrec.ops.hstu_attention_utils import (
     FAM_MASK_GROUP_NULL,
     FAM_MASK_TASK_ISO,
     LAYOUT_BLOCK,
+    LAYOUT_PAPER,
     build_onerank_func_tensor,
 )
 from tzrec.utils.test_util import (
@@ -548,12 +550,14 @@ class _BuildOneRankBlockFuncTensorWrapper(nn.Module):
         num_tasks: int,
         nheads: int = 1,
         group_mask: str = FAM_MASK_GROUP_NULL,
+        group_attn: bool = True,
     ) -> None:
         super().__init__()
         self._group_size = group_size
         self._num_tasks = num_tasks
         self._nheads = nheads
         self._group_mask = group_mask
+        self._group_attn = group_attn
 
     def forward(
         self,
@@ -570,6 +574,7 @@ class _BuildOneRankBlockFuncTensorWrapper(nn.Module):
             layout=LAYOUT_BLOCK,
             group_mask=self._group_mask,
             num_tasks=self._num_tasks,
+            group_attn=self._group_attn,
         )
 
 
@@ -581,6 +586,7 @@ def _build_block_func_tensor(
     nheads: int = 1,
     graph_type: TestGraphType = TestGraphType.NORMAL,
     num_targets_override: Optional[List[int]] = None,
+    group_attn: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """Run ``build_onerank_func_tensor`` on an expanded block-layout batch."""
     seq_lengths = [p + n * group_size for p, n in layout]
@@ -599,6 +605,7 @@ def _build_block_func_tensor(
             num_tasks=num_tasks,
             nheads=nheads,
             group_mask=group_mask,
+            group_attn=group_attn,
         ),
         graph_type,
     )
@@ -746,6 +753,74 @@ class OneRankBlockFuncTensorTest(unittest.TestCase):
                     group_mask=FAM_MASK_TASK_ISO,
                     num_tasks=bad,
                 )
+
+
+    def test_mixer_group_rows_read_prefix_and_self_only(self) -> None:
+        """group_attn=False: every group row sees ``[0, H_b) u {itself}``.
+
+        In-group mixing has moved into :class:`OneRankGroupMixer`, so the
+        group block must vanish from the attention mask -- but the self
+        column stays (cold-start rows with ``H_b = 0`` must stay
+        non-empty), and groups stay mutually invisible.
+        """
+        layout = [(3, 2), (7, 1), (1, 4)]
+        group_size, num_tasks = 12, 7
+        func, seq_offsets, padded_len = _build_block_func_tensor(
+            layout, group_size, num_tasks, group_attn=False
+        )
+        got = _decode_attn_func_to_mask(func, seq_offsets, padded_len)
+        for b, (prefix_len, num_candidates) in enumerate(layout):
+            mask = got[b, 0]
+            for q in range(prefix_len):
+                self.assertEqual(
+                    set(mask[q].nonzero().flatten().tolist()),
+                    set(range(q + 1)),
+                    msg=f"batch {b} prefix row {q}",
+                )
+            for i in range(num_candidates):
+                base = prefix_len + i * group_size
+                for q in range(base, base + group_size):
+                    self.assertEqual(
+                        set(mask[q].nonzero().flatten().tolist()),
+                        set(range(prefix_len)) | {q},
+                        msg=f"batch {b} group row {q}",
+                    )
+                # Groups stay mutually invisible under the mixer too.
+                for j in range(num_candidates):
+                    if j == i:
+                        continue
+                    cols = slice(
+                        prefix_len + j * group_size,
+                        prefix_len + (j + 1) * group_size,
+                    )
+                    self.assertFalse(
+                        mask[base : base + group_size, cols].any(),
+                        msg=f"batch {b}: group {i} sees group {j}",
+                    )
+
+    def test_mixer_no_prefix_rows_still_see_themselves(self) -> None:
+        """``H_b = 0`` (cold start): the self column keeps rows non-empty."""
+        func, seq_offsets, padded_len = _build_block_func_tensor(
+            [(0, 3)], 5, 2, group_attn=False
+        )
+        mask = _decode_attn_func_to_mask(func, seq_offsets, padded_len)[0, 0]
+        for q in range(15):
+            self.assertEqual(set(mask[q].nonzero().flatten().tolist()), {q})
+
+    def test_mixer_rejects_paper_layout(self) -> None:
+        """The mixer replaces the in-group attention of family-token
+        groups; the paper layout has no such thing."""
+        seq_offsets = torch.tensor([0, 4], dtype=torch.int32)
+        with self.assertRaisesRegex(ValueError, "group_attn=False"):
+            build_onerank_func_tensor(
+                nheads=1,
+                seq_offsets=seq_offsets,
+                total_q=4,
+                num_targets=torch.tensor([2], dtype=torch.int32),
+                group_size=4,
+                layout=LAYOUT_PAPER,
+                group_attn=False,
+            )
 
 
 class OneRankBlockTokenizerTest(unittest.TestCase):
@@ -899,6 +974,147 @@ class OneRankBlockComposeOutputTest(unittest.TestCase):
         self.assertIsNone(full)
 
 
+class OneRankGroupMixerTest(unittest.TestCase):
+    """Verify the RankMixer block (token mixing + per-slot FFN)."""
+
+    def _build(
+        self, group_size: int = 3, dim: int = 4, mult: int = 1, layers: int = 1
+    ) -> OneRankGroupMixer:
+        torch.manual_seed(0)
+        return OneRankGroupMixer(
+            group_size=group_size,
+            embedding_dim=dim,
+            ffn_multiplier=mult,
+            num_layers=layers,
+        )
+
+    def test_forward_matches_reference(self) -> None:
+        """The forward is exactly eq. 3-7: transpose mixing, residual+LN,
+        per-slot FFN, residual+LN -- written out here from the paper."""
+        T, D, N = 2, 4, 3
+        mixer = self._build(group_size=T, dim=D)
+        x = torch.randn(N * T, D)
+        out = mixer(x)
+
+        ffns = mixer._layers[0]
+        norm_mix, norm_ffn = mixer._norms[0]
+        xr = x.view(N, T, D)
+        # Token mixing: head h of every token, concatenated.
+        heads = xr.view(N, T, T, D // T)
+        mixed = heads.permute(0, 2, 1, 3).reshape(N, T, D)
+        s = norm_mix(xr + mixed)
+        v = torch.stack([ffns[t](s[:, t, :]) for t in range(T)], dim=1)
+        want = norm_ffn(s + v).reshape(-1, D)
+        torch.testing.assert_close(out, want)
+
+    def test_mixing_reaches_every_slot_pair(self) -> None:
+        """Output slot t depends on every input slot: all-to-all mixing.
+
+        This is what the in-group attention bought in the famtok arm; if
+        the transpose wiring were wrong (e.g. no permute), the mixer would
+        degenerate to slot-local processing and the off-diagonal
+        gradients would be zero.
+
+        The probe weights the output randomly: with ``gamma=1, beta=0`` a
+        LayerNorm row sums to the constant 0, and its Jacobian has zero
+        column sums -- a plain ``.sum()`` loss (all-ones upstream
+        gradient) is annihilated exactly, and its rounding noise would
+        decide the assertion.
+        """
+        T, D = 3, 6
+        mixer = self._build(group_size=T, dim=D)
+        x = torch.randn(1 * T, D, requires_grad=True)
+        out = mixer(x)
+        torch.manual_seed(1)
+        probes = torch.randn(T, D)
+        for t in range(T):
+            g = torch.autograd.grad(
+                (out.view(T, D)[t] * probes[t]).sum(), x, retain_graph=True
+            )[0]
+            self.assertEqual(tuple(g.shape), (T, D))
+            for u in range(T):
+                self.assertTrue(
+                    torch.any(g[u] != 0),
+                    msg=f"output slot {t} does not depend on input slot {u}",
+                )
+
+    def test_candidate_blocks_are_processed_independently(self) -> None:
+        """Permuting candidates permutes the outputs: the mixer acts per
+        group, never across candidates (the func tensor guarantees the
+        same for attention)."""
+        T, D = 3, 5  # D_pad = 6: exercises the padding path too
+        mixer = self._build(group_size=T, dim=D)
+        x = torch.randn(4 * T, D)
+        out = mixer(x)
+        perm = [2, 0, 3, 1]
+        outp = mixer(torch.cat([x[i * T : (i + 1) * T] for i in perm]))
+        for j, i in enumerate(perm):
+            torch.testing.assert_close(
+                outp[j * T : (j + 1) * T], out[i * T : (i + 1) * T]
+            )
+
+    def test_per_slot_ffn_parameters_are_isolated(self) -> None:
+        """Slot t's FFN weights get gradient only from output slot t.
+
+        The ablation axis RankMixer found largest (its Table 2): a shared
+        FFN would put every slot's gradient into every weight.  The probe
+        is weighted randomly -- a plain ``.sum()`` would be the degenerate
+        all-ones direction that LayerNorm annihilates (see
+        ``test_mixing_reaches_every_slot_pair``).
+        """
+        T, D = 3, 4
+        mixer = self._build(group_size=T, dim=D)
+        out = mixer(torch.randn(2 * T, D))
+        torch.manual_seed(1)
+        w = torch.randn(D)
+        (out.view(2, T, D)[:, 1, :] * w).sum().backward()
+        for t, ffn in enumerate(mixer._layers[0]):
+            grad = ffn.fc1.weight.grad
+            trained = grad is not None and torch.any(grad != 0)
+            self.assertEqual(trained, t == 1, msg=f"slot {t}")
+
+    def test_shape_round_trip_and_parameter_budget(self) -> None:
+        """D=512, T=12 (the production probe): padded stream 516, sliced
+        back to 512 at the exit."""
+        T, D = 12, 512
+        mixer = self._build(group_size=T, dim=D)
+        self.assertEqual(mixer.padded_dim, 516)
+        out = mixer(torch.randn(4 * T, D))
+        self.assertEqual(tuple(out.shape), (4 * T, D))
+        D_pad = 516
+        want = T * (2 * D_pad * D_pad + 2 * D_pad) + 2 * 2 * D_pad
+        self.assertEqual(sum(p.numel() for p in mixer.parameters()), want)
+        # The production probe's budget: 6,404,592, against famtok's
+        # W_f = 379,392 -- the capacity note for the experiment report.
+        # Of that budget the family-slot FFNs (5 of 12 slots, ~42%) are
+        # dead under the group_mixer func tensor: no row reads a family
+        # column, so they never leave their init (see the model-level
+        # train-one-step test).
+        self.assertEqual(want, 6404592)
+
+    def test_fx_trace_matches_eager(self) -> None:
+        """The block is one straight-line graph: pad, view/permute/reshape,
+        two LNs and T per-slot FFN calls -- all fx-traceable."""
+        T, D = 3, 5  # padding path
+        mixer = self._build(group_size=T, dim=D)
+        traced = create_test_module(mixer, TestGraphType.FX_TRACE)
+        x = torch.randn(2 * T, D)
+        torch.testing.assert_close(traced(x), mixer(x))
+
+    def test_bad_config_raises(self) -> None:
+        for kwargs, message in (
+            ({"group_size": 0}, "group_size must be positive"),
+            ({"embedding_dim": 0}, "embedding_dim must be positive"),
+            ({"ffn_multiplier": 0}, "ffn_multiplier must be positive"),
+            ({"num_layers": 0}, "num_layers must be positive"),
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaisesRegex(ValueError, message):
+                    OneRankGroupMixer(
+                        **{"group_size": 4, "embedding_dim": 8, **kwargs}
+                    )
+
+
 class OneRankBlockSTULayerTest(unittest.TestCase):
     """Block-layout ``OneRankSTULayer`` construction contracts."""
 
@@ -952,6 +1168,36 @@ class OneRankBlockSTULayerTest(unittest.TestCase):
             self._build(group_mask="FAMILY_MASK_NOPE")
         with self.assertRaisesRegex(ValueError, "num_tasks"):
             self._build(num_tasks=None)
+
+
+    def test_group_mixer_wiring(self) -> None:
+        """group_attn=False flips the kernel window and the cache key.
+
+        The famtok (block + attention) arms look ahead inside the group,
+        so they must lift the CUTLASS causal window; the mixer arm's group
+        rows read prefix + self -- all columns at or left of the query
+        row -- so the lift must be off, and the arms must not share a
+        cached func tensor.
+        """
+        block = self._build()
+        mixer = self._build(group_attn=False)
+        self.assertTrue(block._group_attn)
+        self.assertFalse(mixer._group_attn)
+        self.assertTrue(block.uses_noncausal_func_mask)
+        self.assertFalse(mixer.uses_noncausal_func_mask)
+        self.assertNotEqual(
+            block.attn_func_static_sig, mixer.attn_func_static_sig
+        )
+        self.assertEqual(
+            mixer.attn_func_static_sig,
+            "onerank:LAYOUT_BLOCK:12:2:FAMILY_MASK_TASK_ISO:mixer",
+        )
+
+    def test_group_mixer_requires_block_layout(self) -> None:
+        """group_attn=False without family tokens is a config bug."""
+        kwargs: Dict[str, object] = dict(self._STU_KWARGS)
+        with self.assertRaisesRegex(ValueError, "group_mixer probe"):
+            OneRankSTULayer(group_size=4, group_attn=False, **kwargs)
 
 
 if __name__ == "__main__":

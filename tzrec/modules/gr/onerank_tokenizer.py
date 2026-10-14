@@ -31,12 +31,23 @@ paper layout encodes directly with no candidate replicas.
 The cost is ``N * (K + 1)`` tokens per request, so ``N`` must stay in
 the few-candidates-per-request regime a rerank stage works in (a few to
 a few dozen); it does not scale to full-corpus candidate sets.
+
+The **group mixer** (``group_mixer`` on ``family_tokens``; see
+:class:`OneRankGroupMixer`) moves the in-group half of that attention out
+of the STU stack: a RankMixer block -- parameter-free token-mixing
+transpose plus per-slot FFNs with slot-isolated parameters -- is spliced
+in right after tokenization, and the group rows' func-tensor columns
+shrink to prefix + self.  The tokenization, the ``W_f`` projections, the
+readout and the prefix's causal attention are unchanged, so the arm
+isolates exactly one variable against ``family_tokens``: the in-group
+interaction mechanism (attention vs. transpose + per-slot FFN).
 """
 
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.profiler import record_function
 
 from tzrec.modules.gr.hstu_transducer import HSTUTransducer
@@ -80,6 +91,155 @@ def _fx_check_max_seq_len(
 
 
 torch.fx.wrap(_fx_check_max_seq_len)
+
+
+class _PerSlotFFN(torch.nn.Module):
+    """Two-layer MLP with parameters private to one slot (eq. 6-7)."""
+
+    def __init__(self, dim: int, hidden_multiplier: int) -> None:
+        super().__init__()
+        self.fc1 = torch.nn.Linear(dim, hidden_multiplier * dim)
+        self.fc2 = torch.nn.Linear(hidden_multiplier * dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(F.gelu(self.fc1(x)))
+
+
+class OneRankGroupMixer(BaseModule):
+    """RankMixer block over a candidate's token group (``group_mixer``).
+
+    Replaces the in-group attention of the ``family_tokens`` block layout
+    with RankMixer's two operators (Fan et al., RankMixer):
+
+    * **Multi-head token mixing** (eq. 3-5): each token is cut into
+      ``H = T`` heads (``T`` = group size); head ``h`` of the mixed
+      output is the concatenation of head ``h`` of every input token --
+      i.e. the (T, D) token matrix, viewed as (T, H, D/H), is transposed
+      to (H, T, D/H) and re-flattened to (T, D).  Parameter-free, and
+      ``H = T`` is what keeps the output shaped like the residual.  In
+      attention terms it is a rank-free all-to-all mixing: no QK inner
+      products between heterogeneous feature spaces (the paper's
+      diagnosis of why attention underperforms here).
+    * **Per-slot FFN** (eq. 6-7): every slot gets its own two-layer MLP
+      (``fc1 -> Gelu -> fc2``) with slot-isolated parameters -- the
+      ablation axis the paper found largest (its Table 2).
+
+    Both sub-blocks are residual + LayerNorm (eq. 5).  ``D`` need not be
+    divisible by ``T`` (the production probe is D=512, T=12): the stream
+    is zero-padded to ``D_pad = ceil(D / T) * T`` for the whole block and
+    sliced back to ``D`` at the exit -- the only deviation from the
+    paper, whose feature tokens are built with a divisible ``D`` by
+    construction.
+
+    Capacity note: under the group_mixer func tensor no row reads a
+    group column other than its own and ``_compose_output`` keeps only
+    the task-slot rows, so the *family*-slot FFNs receive no gradient
+    (they stay at init; 5 of 12 slots, ~42% of the parameter budget
+    above in the production probe).  The family embeddings still train
+    -- token mixing reads every input token -- and the task-slot FFNs,
+    the shared norms and the family projections are all live.
+
+    Input / output: the flat expanded group segment
+    ``(total_targets * T, D)`` -- exactly what :class:`OneRankTokenizer`
+    produces and what ``concat_2D_jagged`` consumes, so the mixer splices
+    in between the two with a single ``view``.
+
+    Args:
+        group_size (int): tokens per candidate group ``T`` (``K + F``).
+        embedding_dim (int): STU embedding dim ``D``.
+        ffn_multiplier (int): hidden multiplier ``k`` of the per-slot FFN.
+        num_layers (int): stacked RankMixer blocks.
+        is_inference (bool): whether to run in inference mode.
+    """
+
+    def __init__(
+        self,
+        group_size: int,
+        embedding_dim: int,
+        ffn_multiplier: int = 1,
+        num_layers: int = 1,
+        is_inference: bool = False,
+    ) -> None:
+        super().__init__(is_inference=is_inference)
+        if group_size <= 0:
+            raise ValueError(f"group_size must be positive; got {group_size}")
+        if embedding_dim <= 0:
+            raise ValueError(
+                f"embedding_dim must be positive; got {embedding_dim}"
+            )
+        if ffn_multiplier <= 0:
+            raise ValueError(
+                f"ffn_multiplier must be positive; got {ffn_multiplier}"
+            )
+        if num_layers <= 0:
+            raise ValueError(f"num_layers must be positive; got {num_layers}")
+        self._group_size: int = group_size
+        self._embedding_dim: int = embedding_dim
+        # ceil division without importing math.ceil twice; 512 with T=12
+        # -> 516.
+        self._padded_dim: int = -(-embedding_dim // group_size) * group_size
+        self._layers = torch.nn.ModuleList(
+            torch.nn.ModuleList(
+                _PerSlotFFN(self._padded_dim, ffn_multiplier)
+                for _ in range(group_size)
+            )
+            for _ in range(num_layers)
+        )
+        self._norms = torch.nn.ModuleList(
+            torch.nn.ModuleList(
+                torch.nn.LayerNorm(self._padded_dim) for _ in range(2)
+            )
+            for _ in range(num_layers)
+        )
+
+    @property
+    def group_size(self) -> int:
+        """Tokens per candidate group ``T``."""
+        return self._group_size
+
+    @property
+    def padded_dim(self) -> int:
+        """The stream width inside the block: ``ceil(D/T)*T``."""
+        return self._padded_dim
+
+    def forward(self, group_embeddings: torch.Tensor) -> torch.Tensor:
+        """Mix each candidate's ``[t_1..t_K, x^1..x^F]`` block in place.
+
+        Args:
+            group_embeddings (torch.Tensor): the expanded group segment
+                ``(total_targets * T, D)``; candidate ``i`` owns rows
+                ``[i*T, (i+1)*T)``.
+
+        Returns:
+            torch.Tensor: same shape; every token carries the whole
+            group's information (token mixing) passed through its own
+            FFN.
+        """
+        T = self._group_size
+        D = self._embedding_dim
+        D_pad = self._padded_dim
+        pad = D_pad - D  # static: decided at construction, fx-safe
+        x = group_embeddings.view(-1, T, D)
+        if pad:
+            x = F.pad(x, (0, pad))
+        for ffns, norms in zip(self._layers, self._norms):
+            # --- Token mixing (eq. 3-5): (N, T, D_pad) viewed as
+            # (N, token, head, D_pad/T) -> heads permuted onto the token
+            # axis -> (N, T, D_pad).  With H = T this is the transpose of
+            # the token matrix and carries no parameters.
+            heads = x.view(-1, T, T, D_pad // T)
+            mixed = heads.permute(0, 2, 1, 3).reshape(-1, T, D_pad)
+            x = norms[0](x + mixed)
+            # --- Per-slot FFN (eq. 6-7): slot-isolated parameters.
+            x = norms[1](
+                x
+                + torch.stack(
+                    [ffns[t](x[:, t, :]) for t in range(T)], dim=1
+                )
+            )
+        if pad:
+            x = x[..., :D]
+        return x.reshape(-1, D)
 
 
 class OneRankTokenizer(BaseModule):
@@ -287,6 +447,10 @@ class OneRankSTULayer(STULayer):
         num_tasks (Optional[int]): number of task tokens ``K``; required
             in the block layout (the ``FAM_MASK_TASK_ISO`` mask splits
             task rows from family rows at slot ``K``), ignored otherwise.
+        group_attn (bool): whether group rows attend their own group
+            inside attention.  ``False`` (the ``group_mixer`` probe)
+            restricts them to prefix + self and requires the block
+            layout; see :class:`OneRankGroupMixer`.
         **kwargs: forwarded verbatim to :class:`STULayer`.
     """
 
@@ -296,6 +460,7 @@ class OneRankSTULayer(STULayer):
         layout: str = LAYOUT_PAPER,
         group_mask: str = FAM_MASK_GROUP_NULL,
         num_tasks: Optional[int] = None,
+        group_attn: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -320,10 +485,16 @@ class OneRankSTULayer(STULayer):
                     f"(K task tokens + F >= 1 family tokens); got "
                     f"num_tasks={num_tasks}, group_size={group_size}"
                 )
+        if not group_attn and layout != LAYOUT_BLOCK:
+            raise ValueError(
+                f"group_attn=False (the group_mixer probe) requires the "
+                f"block layout (family_tokens); got layout={layout!r}"
+            )
         self._group_size: int = group_size
         self._layout: str = layout
         self._group_mask: str = group_mask
         self._group_num_tasks: Optional[int] = num_tasks
+        self._group_attn: bool = group_attn
         if self._sla_k1 > 0 or self._sla_k2 > 0:
             raise ValueError(
                 f"OneRank builds its own NFUNC mask and cannot also apply SLA; "
@@ -369,7 +540,14 @@ class OneRankSTULayer(STULayer):
         CUTLASS attention window must be lifted from ``(-1, 0)`` to
         ``(-1, -1)`` or the kernel would silently clip the family
         columns out of every group row.
+
+        ``group_attn=False`` (the group_mixer probe) instead shrinks
+        every group row's visible set to prefix + self -- every visible
+        column is again at or left of the query row, so the causal
+        window is a superset and the lift would be a no-op.
         """
+        if not self._group_attn:
+            return False
         return self._layout == LAYOUT_BLOCK
 
     @property
@@ -377,14 +555,16 @@ class OneRankSTULayer(STULayer):
         """OneRank NFUNC cache key.
 
         Prefixed so it can never collide with ``STULayer``'s SLA
-        signature in a mixed stack.  ``layout`` and ``group_mask`` must
-        be part of the key: the func tensor is cached across layers
-        keyed on this string, and two OneRank layers with different
-        token layouts or in-group masks must not share one tensor.
+        signature in a mixed stack.  ``layout``, ``group_mask`` and
+        ``group_attn`` must be part of the key: the func tensor is
+        cached across layers keyed on this string, and two OneRank
+        layers with different token layouts, in-group masks or
+        in-group attention modes must not share one tensor.
         """
         return (
             f"onerank:{self._layout}:{self._group_size}:"
-            f"{self._num_heads}:{self._group_mask}:attn"
+            f"{self._num_heads}:{self._group_mask}:"
+            f"{'attn' if self._group_attn else 'mixer'}"
         )
 
     def _build_attn_func(
@@ -408,6 +588,7 @@ class OneRankSTULayer(STULayer):
             layout=self._layout,
             group_mask=self._group_mask,
             num_tasks=self._group_num_tasks,
+            group_attn=self._group_attn,
         )
 
     def truncate_input(
@@ -482,6 +663,13 @@ class OneRankHSTUTransducer(HSTUTransducer):
             ``family_dims`` is given.
         family_names (Optional[List[str]]): human-readable family names,
             kept for reading the learned projections off a checkpoint.
+        group_mixer (Optional[Tuple[int, int]]): ``(ffn_multiplier,
+            num_layers)`` of the RankMixer in-group mixer (see
+            :class:`OneRankGroupMixer`); given -> in-group mixing moves out
+            of attention into the mixer block (group rows read prefix +
+            self only) and the block layout is required.  ``None`` ->
+            in-group interaction stays inside attention (the
+            ``family_tokens`` behavior).
         **kwargs: forwarded verbatim to :class:`HSTUTransducer`.
     """
 
@@ -493,6 +681,7 @@ class OneRankHSTUTransducer(HSTUTransducer):
         family_dims: Optional[List[int]] = None,
         family_feature_ids: Optional[List[int]] = None,
         family_names: Optional[List[str]] = None,
+        group_mixer: Optional[Tuple[int, int]] = None,
         **kwargs: Any,
     ) -> None:
         if num_task_tokens <= 0:
@@ -515,6 +704,22 @@ class OneRankHSTUTransducer(HSTUTransducer):
                     f"dim (target_embedding_dim): sum(family_dims)="
                     f"{sum(family_dims)}, target_embedding_dim={raw_dim}"
                 )
+        if group_mixer is not None:
+            if family_dims is None:
+                raise ValueError(
+                    "group_mixer requires family_tokens (the block layout): "
+                    "it replaces the in-group attention of the "
+                    "family-token groups"
+                )
+            if (
+                len(group_mixer) != 2
+                or group_mixer[0] <= 0
+                or group_mixer[1] <= 0
+            ):
+                raise ValueError(
+                    f"group_mixer must be (ffn_multiplier, num_layers), "
+                    f"both positive ints; got {group_mixer!r}"
+                )
         self._max_seq_len: int = max_seq_len
         stu = dict(kwargs.pop("stu"))
         # Routed through the stu dict because `_build_stu_layer` runs inside
@@ -527,6 +732,10 @@ class OneRankHSTUTransducer(HSTUTransducer):
         else:
             stu["group_size"] = num_task_tokens + 1
             stu["layout"] = LAYOUT_PAPER
+        # group_mixer (RankMixer probe): in-group mixing leaves attention,
+        # so the group rows' visible set shrinks to prefix + self (see
+        # build_onerank_func_tensor).
+        stu["group_attn"] = group_mixer is None
         # The paper layout spends all three func-tensor column intervals
         # on `prefix + own group`, so contextual tokens must be ordinary
         # causal prefix. Resolve the `-1` sentinel ("inherit from the
@@ -575,6 +784,17 @@ class OneRankHSTUTransducer(HSTUTransducer):
             family_dims=family_dims,
             family_feature_ids=family_feature_ids,
             family_names=family_names,
+        )
+        self._group_mixer: Optional[OneRankGroupMixer] = (
+            None
+            if group_mixer is None
+            else OneRankGroupMixer(
+                group_size=stu["group_size"],
+                embedding_dim=stu["embedding_dim"],
+                ffn_multiplier=group_mixer[0],
+                num_layers=group_mixer[1],
+                is_inference=self._is_inference,
+            )
         )
 
     def _build_stu_layer(self, stu: Dict[str, Any]) -> STU:
@@ -642,6 +862,16 @@ class OneRankHSTUTransducer(HSTUTransducer):
                 tokens = self._tokenizer(
                     grouped_features["candidate.sequence"]
                 )
+                if self._group_mixer is not None:
+                    # The group_mixer probe replaces the in-group
+                    # attention: mix each [t_1..t_K, x^1..x^F] block
+                    # here (parameter-free transpose + per-slot FFN), so
+                    # the STU layers only have to route group rows to
+                    # the prefix (their func-tensor second interval is
+                    # the self column).  The input is exactly the flat
+                    # (total_targets * group_size, D) segment the
+                    # tokenizer just produced.
+                    tokens = self._group_mixer(tokens)
                 # The .to() anchors the dtype to the embedding pipeline:
                 # under AMP the dense candidate features arrive in bf16
                 # (so the projected family tokens are bf16 too) while the

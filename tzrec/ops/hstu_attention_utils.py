@@ -174,6 +174,7 @@ def build_onerank_func_tensor(
     layout: str = LAYOUT_PAPER,
     group_mask: str = FAM_MASK_GROUP_NULL,
     num_tasks: Optional[int] = None,
+    group_attn: bool = True,
 ) -> torch.Tensor:
     """Build the arbitrary-mask func tensor for the OneRank group layout.
 
@@ -235,6 +236,16 @@ def build_onerank_func_tensor(
       block only, so a family summary stays a pure function of the
       shared features and never observes any task state.
 
+    With ``group_attn=False`` (the ``group_mixer`` probe) the group rows
+    instead attend ``[0, H_b) u {p}`` -- prefix and self -- because
+    in-group mixing has moved into a RankMixer block outside attention.
+    ``group_mask`` is then ignored: no group column other than the row's
+    own is visible.  The self column keeps every query row non-empty (a
+    cold-start request has ``H_b = 0``, and an all-masked row is NaN
+    through the PyTorch masked softmax); it is the same single-column
+    trailing interval ``FAM_MASK_TASK_ISO`` task rows use, so no new
+    kernel path.
+
     Args:
         nheads: number of attention heads.
         seq_offsets: cumulative sequence offsets ``(B+1,)`` of the
@@ -256,6 +267,9 @@ def build_onerank_func_tensor(
         num_tasks: number of task tokens ``K``; required (and must satisfy
             ``1 <= num_tasks < group_size``) in the block layout, ignored
             otherwise.
+        group_attn: whether group rows attend their own group inside
+            attention.  ``False`` (the ``group_mixer`` probe) restricts
+            them to prefix + self and requires the block layout.
 
     Returns:
         func tensor of shape ``(nheads, HSTU_ARBITRARY_NFUNC, total_q)``,
@@ -279,6 +293,12 @@ def build_onerank_func_tensor(
                 f"(K task tokens + F >= 1 family tokens); got "
                 f"num_tasks={num_tasks}, group_size={group_size}"
             )
+    if not group_attn and layout != LAYOUT_BLOCK:
+        raise ValueError(
+            f"group_attn=False (the group_mixer probe) requires "
+            f"layout={LAYOUT_BLOCK!r} -- it replaces the in-group "
+            f"attention of the family-token groups; got layout={layout!r}"
+        )
     if device is None:
         device = seq_offsets.device
     # The tensor-plumbing below deliberately mirrors build_sla_func_tensor:
@@ -326,7 +346,17 @@ def build_onerank_func_tensor(
     else:
         # LAYOUT_BLOCK; the validation above pinned group_mask to
         # _FAM_MASKS and guaranteed a usable num_tasks.
-        if group_mask == FAM_MASK_GROUP_NULL:
+        if not group_attn:
+            # group_mixer probe: in-group mixing moved out of attention
+            # into a RankMixer block, so a group row reads the prefix and
+            # itself, nothing else -- prefix + self via interval 1, the
+            # trailing intervals parked empty (never a duplicate of an
+            # already-visible column).
+            group_col_min0 = pos_local
+            group_col_max1 = causal
+            self_col_min1 = causal
+            self_col_max2 = causal
+        elif group_mask == FAM_MASK_GROUP_NULL:
             # Whole-group bidirectional: every row (task or family) reads
             # [G, G + gs) via interval 1 and leaves interval 2 empty.
             group_col_min0 = group_base

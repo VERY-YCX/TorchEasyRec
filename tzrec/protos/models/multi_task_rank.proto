@@ -180,6 +180,29 @@ message OneRankFamilyTokens {
     repeated string family_names = 2;
     // group visibility strategy; see OneRankFamilyTokenMask.
     optional OneRankFamilyTokenMask group_mask = 3 [default = FAMILY_MASK_GROUP_NULL];
+    // RankMixer-style in-group mixing (the group_mixer probe): replace the
+    // in-group attention with a parameter-free token-mixing transpose
+    // (RankMixer eq. 3-5; H = T heads so the mixed output keeps the (T, D)
+    // shape of the residual) followed by per-slot FFNs with slot-isolated
+    // parameters (eq. 6-7), spliced in right after tokenization -- before
+    // the STU stack.  Group rows then read prefix + self only: the
+    // func-tensor intervals carry no group column but the row's own.  The
+    // prefix keeps its plain causal HSTU attention and the family
+    // projections W_f are unchanged, so the arm isolates exactly one
+    // variable against family_tokens: the in-group interaction mechanism
+    // (attention vs. transpose + per-slot FFN).
+    optional OneRankFamilyMixer group_mixer = 4;
+}
+
+// RankMixer block over a candidate's token group (see
+// OneRankFamilyTokens.group_mixer).
+message OneRankFamilyMixer {
+    // hidden-dim multiplier ``k`` of the per-slot FFN: W_1 is in
+    // R^{D_pad x k*D_pad} and W_2 in R^{k*D_pad x D_pad}, one pair per
+    // slot.
+    optional uint32 ffn_multiplier = 1 [default = 1];
+    // number of stacked RankMixer blocks (token mixing + per-slot FFN).
+    optional uint32 num_layers = 2 [default = 1];
 }
 
 message OneRankConfig {

@@ -1039,6 +1039,117 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
             self.assertTrue(torch.isfinite(grad).all())
         self.assertIsNotNone(tokenizer._task_tokens.grad)
 
+    _GROUP_MIXER_TOKENS = multi_task_rank_pb2.OneRankFamilyTokens(
+        feature_family_ids=[0, 1],
+        family_names=["video_id", "video_cat"],
+        group_mixer=multi_task_rank_pb2.OneRankFamilyMixer(
+            ffn_multiplier=2, num_layers=1
+        ),
+    )
+
+    def test_group_mixer_swaps_group_attention_for_the_block(self) -> None:
+        """``group_mixer`` moves in-group mixing out of the attention.
+
+        The famtok arm reads the whole group inside attention (noncausal
+        lift on); the mixer arm's group rows read prefix + self only, so
+        the lift must be off and the two arms must not share a cached
+        func tensor.  The transducer owns a RankMixer block sized to the
+        group, while the tokenizer, the group stride and the scaling
+        divisor are untouched -- only the interaction operator changes.
+        """
+        famtok = _build_model(
+            device=torch.device("cpu"),
+            family_tokens=self._FAMILY_TOKENS,
+            max_seq_len=self._BLOCK_MAX_SEQ_LEN,
+        )
+        mixer = _build_model(
+            device=torch.device("cpu"),
+            family_tokens=self._GROUP_MIXER_TOKENS,
+            max_seq_len=self._BLOCK_MAX_SEQ_LEN,
+        )
+        self.assertIsNone(famtok._hstu_transducer._group_mixer)
+        group_mixer = mixer._hstu_transducer._group_mixer
+        self.assertIsNotNone(group_mixer)
+        self.assertEqual(group_mixer.group_size, len(_TASK_NAMES) + 2)
+        # D=64, T=5: the stream is padded to ceil(64/5)*5 = 65 inside the
+        # block -- the production probe's 512/12 -> 516 in miniature.
+        self.assertEqual(group_mixer.padded_dim, 65)
+
+        famtok_layers = famtok._hstu_transducer._stu_module._stu_layers
+        mixer_layers = mixer._hstu_transducer._stu_module._stu_layers
+        for famtok_layer, layer in zip(famtok_layers, mixer_layers):
+            self.assertTrue(famtok_layer._group_attn)
+            self.assertFalse(layer._group_attn)
+            self.assertTrue(famtok_layer.uses_noncausal_func_mask)
+            self.assertFalse(layer.uses_noncausal_func_mask)
+            self.assertNotEqual(
+                famtok_layer.attn_func_static_sig, layer.attn_func_static_sig
+            )
+        # The group stride (and the scaling divisor) belongs to the
+        # layout, not to the interaction operator.
+        self.assertEqual(
+            mixer._hstu_transducer._tokenizer.group_size,
+            famtok._hstu_transducer._tokenizer.group_size,
+        )
+        for layer in mixer_layers:
+            self.assertEqual(layer._scaling_seqlen, self._BLOCK_MAX_SEQ_LEN)
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_group_mixer_train_one_step(self) -> None:
+        """End to end with the mixer: which mixer parameters actually train.
+
+        Under the mixer's func tensor no row reads a group column other
+        than its own, and ``_compose_output`` keeps only the task-slot
+        rows -- so the *family*-slot FFNs have no downstream and must
+        come back with all-zero gradients (the optimizer leaves them at
+        init; in the production probe that is 5 of 12 slots, ~42% of
+        the mixer's capacity -- the capacity note for the experiment
+        report).  The task-slot FFNs, the shared norms, and the family
+        projections (token mixing reads every input token) must all
+        receive finite gradients.
+        """
+        device = torch.device("cuda")
+        model = _build_model(
+            device=device,
+            family_tokens=self._GROUP_MIXER_TOKENS,
+            max_seq_len=self._BLOCK_MAX_SEQ_LEN,
+            listwise_loss=_listwise_loss_cfg(),
+        )
+        model.set_kernel(Kernel.PYTORCH)
+        wrapper = TrainWrapper(model, device=device).to(device)
+
+        total_loss, _ = wrapper(_build_batch(device=device))
+        self.assertTrue(torch.isfinite(total_loss))
+        total_loss.backward()
+
+        group_mixer = wrapper.model._hstu_transducer._group_mixer
+        num_tasks = len(_TASK_NAMES)
+        for t, ffn in enumerate(group_mixer._layers[0]):
+            grad = ffn.fc1.weight.grad
+            if t < num_tasks:
+                self.assertIsNotNone(grad, msg=f"task slot {t} FFN has no grad")
+                self.assertTrue(torch.isfinite(grad).all())
+                self.assertGreater(grad.abs().max().item(), 0.0)
+            else:
+                # The parameters do sit in the graph (autograd allocates
+                # the tensor), but no row reads a family column under
+                # the mixer mask, so every entry must be exactly zero.
+                self.assertIsNotNone(grad, msg=f"family slot {t} FFN missing")
+                self.assertEqual(
+                    grad.abs().max().item(),
+                    0.0,
+                    msg=f"family slot {t} FFN unexpectedly has downstream",
+                )
+        for norm in group_mixer._norms[0]:
+            self.assertIsNotNone(norm.weight.grad)
+            self.assertTrue(torch.isfinite(norm.weight.grad).all())
+
+        tokenizer = wrapper.model._hstu_transducer._tokenizer
+        for f, proj in enumerate(tokenizer._family_projs):
+            self.assertIsNotNone(proj.weight.grad, msg=f"family {f} has no grad")
+            self.assertTrue(torch.isfinite(proj.weight.grad).all())
+        self.assertIsNotNone(tokenizer._task_tokens.grad)
+
     def test_runtime_rejects_inflated_sequences_above_max_seq_len(self) -> None:
         """Requests whose inflated sequence exceeds ``max_seq_len`` fail loudly.
 
@@ -1135,6 +1246,73 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(task_tokens.grad).all())
         self.assertGreater(task_tokens.grad.abs().max().item(), 0.0)
 
+    @mark_ci_scope("h20", "gpu")
+    @unittest.skipIf(*cutlass_hstu_unavailable)
+    @unittest.skipIf(*gpu_unavailable)
+    def test_cutlass_group_mixer_forward_backward(self) -> None:
+        """The mixer mask end to end on the production (CUTLASS) kernel.
+
+        The group rows' second func-tensor interval is ``[pos_local,
+        causal)`` -- both boundaries at or left of the query row, so no
+        noncausal lift is requested and the kernel path is not new.
+        Still, the two kernels read the encoding independently, so the
+        probe must agree with the PyTorch reference under bf16, and its
+        backward must reach the mixer's live parameters (the task-slot
+        FFNs) and the task tokens.
+        """
+        device = torch.device("cuda")
+        batch = _build_batch(device=device)
+        model = _build_model(
+            device=device,
+            family_tokens=self._GROUP_MIXER_TOKENS,
+            max_seq_len=self._BLOCK_MAX_SEQ_LEN,
+            listwise_loss=_listwise_loss_cfg(),
+        )
+
+        # Backward on CUTLASS, trained as production does (bf16 through
+        # TrainWrapper's own knob; see
+        # test_cutlass_backward_reaches_the_task_tokens).
+        model.set_kernel(Kernel.CUTLASS)
+        wrapper = TrainWrapper(model, device=device, mixed_precision="BF16").to(
+            device
+        )
+        total_loss, _ = wrapper(batch)
+        total_loss.float().backward()
+
+        group_mixer = wrapper.model._hstu_transducer._group_mixer
+        for t, ffn in enumerate(group_mixer._layers[0]):
+            if t >= len(_TASK_NAMES):
+                continue  # family slots are dead by design; CPU test pins it
+            grad = ffn.fc1.weight.grad
+            self.assertIsNotNone(grad, msg=f"task slot {t} FFN has no grad")
+            self.assertTrue(torch.isfinite(grad).all())
+            self.assertGreater(grad.abs().max().item(), 0.0)
+        task_tokens = wrapper.model._hstu_transducer._tokenizer._task_tokens
+        self.assertIsNotNone(task_tokens.grad)
+        self.assertTrue(torch.isfinite(task_tokens.grad).all())
+        self.assertGreater(task_tokens.grad.abs().max().item(), 0.0)
+
+        # Forward cross-check: CUTLASS must decode the mixer mask the
+        # same way the PyTorch kernel does.
+        model.eval()
+        outputs = {}
+        for kernel in (Kernel.PYTORCH, Kernel.CUTLASS):
+            model.set_kernel(kernel)
+            with (
+                torch.no_grad(),
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16),
+            ):
+                outputs[kernel] = {
+                    task_name: model.predict(batch)[f"probs_{task_name}"].float()
+                    for task_name in _TASK_NAMES
+                }
+        for task_name in _TASK_NAMES:
+            got = outputs[Kernel.CUTLASS][task_name]
+            want = outputs[Kernel.PYTORCH][task_name]
+            self.assertTrue(torch.isfinite(got).all(), f"{task_name} not finite")
+            torch.testing.assert_close(
+                got, want, rtol=5e-2, atol=5e-2, msg=f"kernel mismatch on {task_name}"
+            )
 
 if __name__ == "__main__":
     unittest.main()

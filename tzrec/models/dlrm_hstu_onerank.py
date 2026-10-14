@@ -117,6 +117,7 @@ class DlrmHSTUOneRank(DlrmHSTU):
         family_feature_ids = None
         family_names = None
         group_mask = FAM_MASK_GROUP_NULL
+        group_mixer = None
         onerank = self._model_config.onerank
         if onerank.HasField("family_tokens"):
             # family_tokens (Layer 2 probe): the block layout of K task +
@@ -163,6 +164,14 @@ class DlrmHSTUOneRank(DlrmHSTU):
                 )
             family_names = names or [f"family_{i}" for i in range(n_fam)]
             family_feature_ids = per_dim_ids
+            if ft.HasField("group_mixer"):
+                # proto -> (ffn_multiplier, num_layers); positivity and
+                # the block-layout requirement are validated by the
+                # transducer / OneRankGroupMixer.
+                group_mixer = (
+                    int(ft.group_mixer.ffn_multiplier),
+                    int(ft.group_mixer.num_layers),
+                )
         return OneRankHSTUTransducer(
             num_task_tokens=num_tasks,
             max_seq_len=self._model_config.max_seq_len,
@@ -170,6 +179,7 @@ class DlrmHSTUOneRank(DlrmHSTU):
             family_dims=family_dims,
             family_feature_ids=family_feature_ids,
             family_names=family_names,
+            group_mixer=group_mixer,
             uih_embedding_dim=self.embedding_group.group_total_dim("uih"),
             target_embedding_dim=self.embedding_group.group_total_dim("candidate"),
             contextual_feature_dim=contextual_feature_dim,
