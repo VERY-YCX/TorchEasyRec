@@ -856,8 +856,16 @@ def calculate_shard_storages(
             dynamicemb_options=dynamicemb_options,
         )
     else:
+        # First arg is passed POSITIONALLY on purpose: torchrec 1.6 names it
+        # ``sharder`` (ModuleSharder, and its populate_estimates hands this
+        # estimate() a sharder map, so ``sharder_data`` here IS a sharder),
+        # while torchrec 1.7 renamed it to ``sharder_data`` (SharderData, and
+        # populate_estimates hands over a SharderDataMap).  tzrec's
+        # estimate() receives whichever type the installed torchrec hands
+        # over, so the positional call is compatible with both while the
+        # ``sharder_data=`` keyword crashes on 1.6 (unexpected kwarg).
         return tzrec_calculate_shard_storages(
-            sharder_data=sharder_data,
+            sharder_data,
             sharding_type=sharding_type,
             tensor=tensor,
             compute_device=compute_device,
