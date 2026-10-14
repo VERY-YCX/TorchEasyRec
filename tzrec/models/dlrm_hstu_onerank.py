@@ -18,7 +18,10 @@ from torch.autograd.profiler import record_function
 from tzrec.features.feature import BaseFeature
 from tzrec.models.dlrm_hstu import DlrmHSTU
 from tzrec.models.rank_model import RankModel
-from tzrec.modules.gr.onerank_tokenizer import OneRankHSTUTransducer
+from tzrec.modules.gr.onerank_tokenizer import (
+    FAM_MASK_GROUP_NULL,
+    OneRankHSTUTransducer,
+)
 from tzrec.modules.task_tower import OneRankPredictionHead
 from tzrec.ops.utils import set_static_max_seq_lens
 from tzrec.protos.model_pb2 import ModelConfig
@@ -110,9 +113,63 @@ class DlrmHSTUOneRank(DlrmHSTU):
                     f"product, so num_class > 1 is not supported; task "
                     f"'{task_cfg.task_name}' has num_class={task_cfg.num_class}."
                 )
+        family_dims = None
+        family_feature_ids = None
+        family_names = None
+        group_mask = FAM_MASK_GROUP_NULL
+        onerank = self._model_config.onerank
+        if onerank.HasField("family_tokens"):
+            # family_tokens (Layer 2 probe): the block layout of K task +
+            # F family tokens, the group_mask enum naming the in-group
+            # visibility strategy (see build_onerank_func_tensor).
+            ft = onerank.family_tokens
+            group_mask = multi_task_rank_pb2.OneRankFamilyTokenMask.Name(
+                ft.group_mask
+            )
+            # Per-feature -> per-dimension expansion: the proto carries one
+            # family id per candidate-group feature, the tokenizer consumes
+            # one id per dimension of the raw candidate features
+            # (``grouped_features["candidate.sequence"]``).
+            feature_ids = [int(i) for i in ft.feature_family_ids]
+            feature_dims = self.embedding_group.group_dims("candidate.sequence")
+            if len(feature_ids) != len(feature_dims):
+                raise ValueError(
+                    f"onerank.family_tokens.feature_family_ids has "
+                    f"{len(feature_ids)} entries but the candidate group "
+                    f"carries {len(feature_dims)} sequence features."
+                )
+            per_dim_ids = [
+                family_id
+                for family_id, dim in zip(feature_ids, feature_dims)
+                for _ in range(dim)
+            ]
+            n_fam = max(per_dim_ids) + 1
+            family_dims = [
+                sum(1 for fid in per_dim_ids if fid == f) for f in range(n_fam)
+            ]
+            if 0 in family_dims:
+                empty = [i for i, d in enumerate(family_dims) if d == 0]
+                raise ValueError(
+                    f"onerank.family_tokens families {empty} own no "
+                    "dimensions; every family must cover at least one "
+                    "feature"
+                )
+            names = list(ft.family_names)
+            if names and len(names) != n_fam:
+                raise ValueError(
+                    f"onerank.family_tokens.family_names has "
+                    f"{len(names)} entries but feature_family_ids imply "
+                    f"{n_fam} families"
+                )
+            family_names = names or [f"family_{i}" for i in range(n_fam)]
+            family_feature_ids = per_dim_ids
         return OneRankHSTUTransducer(
             num_task_tokens=num_tasks,
             max_seq_len=self._model_config.max_seq_len,
+            group_mask=group_mask,
+            family_dims=family_dims,
+            family_feature_ids=family_feature_ids,
+            family_names=family_names,
             uih_embedding_dim=self.embedding_group.group_total_dim("uih"),
             target_embedding_dim=self.embedding_group.group_total_dim("candidate"),
             contextual_feature_dim=contextual_feature_dim,

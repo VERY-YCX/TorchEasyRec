@@ -33,7 +33,12 @@ from tzrec.modules.gr.onerank_tokenizer import (
 )
 from tzrec.ops import Kernel
 from tzrec.ops._pytorch.pt_hstu_attention import _decode_attn_func_to_mask
-from tzrec.ops.hstu_attention_utils import build_onerank_func_tensor
+from tzrec.ops.hstu_attention_utils import (
+    FAM_MASK_GROUP_NULL,
+    FAM_MASK_TASK_ISO,
+    LAYOUT_BLOCK,
+    build_onerank_func_tensor,
+)
 from tzrec.utils.test_util import (
     TestGraphType,
     create_test_module,
@@ -352,7 +357,10 @@ class OneRankSTULayerTest(unittest.TestCase):
         the wrong mask.
         """
         layer = self._build(group_size=8, num_heads=4)
-        self.assertEqual(layer.attn_func_static_sig, "onerank:8:4")
+        self.assertEqual(
+            layer.attn_func_static_sig,
+            "onerank:LAYOUT_PAPER:8:4:FAMILY_MASK_GROUP_NULL:attn",
+        )
         self.assertNotEqual(
             layer.attn_func_static_sig,
             self._build(group_size=8, num_heads=2).attn_func_static_sig,
@@ -481,6 +489,469 @@ class OneRankComposeOutputTest(unittest.TestCase):
         )
         self.assertEqual(out.shape, (sum(candidates), K, D))
         self.assertIsNone(full)
+
+
+# (name, K task tokens, F family tokens, [(prefix_len, num_candidates), ...])
+# per batch sample; group_size = K + F.
+_BLOCK_LAYOUT_CASES = [
+    ("single_task", 1, 1, [(3, 2)]),
+    ("three_two", 3, 2, [(4, 2)]),
+    ("seven_five", 7, 5, [(5, 3)]),
+    ("no_prefix", 2, 2, [(0, 2)]),
+    ("mixed_batch", 3, 1, [(3, 2), (7, 1), (1, 4)]),
+]
+
+
+def _reference_block_mask(
+    layout: List[Tuple[int, int]],
+    group_size: int,
+    num_tasks: int,
+    padded_len: int,
+    group_mask: str = FAM_MASK_GROUP_NULL,
+) -> torch.Tensor:
+    """Write out the block (``family_tokens``) layout as a dense mask.
+
+    ``X = [prefix (H) | G_1 | ... | G_N]`` with
+    ``G_i = [t_1, ..., t_K, x^1, ..., x^F]``:
+
+    * prefix rows are plain causal;
+    * ``FAM_MASK_GROUP_NULL``: every group row -- task or family --
+      sees the whole prefix plus its whole group, both directions;
+    * ``FAM_MASK_TASK_ISO``: a task row sees the whole prefix, itself
+      and the family block; a family row sees the whole prefix and the
+      family block, never any task token.
+    """
+    mask = torch.zeros(len(layout), padded_len, padded_len, dtype=torch.bool)
+    for b, (prefix_len, num_candidates) in enumerate(layout):
+        for q in range(prefix_len):
+            mask[b, q, : q + 1] = True
+        for i in range(num_candidates):
+            base = prefix_len + i * group_size
+            fam_lo, fam_hi = base + num_tasks, base + group_size
+            for slot in range(group_size):
+                q = base + slot
+                mask[b, q, :prefix_len] = True
+                if group_mask == FAM_MASK_GROUP_NULL:
+                    mask[b, q, base : base + group_size] = True
+                elif slot < num_tasks:  # a task row
+                    mask[b, q, q] = True
+                    mask[b, q, fam_lo:fam_hi] = True
+                else:  # a family row
+                    mask[b, q, fam_lo:fam_hi] = True
+    return mask
+
+
+class _BuildOneRankBlockFuncTensorWrapper(nn.Module):
+    def __init__(
+        self,
+        group_size: int,
+        num_tasks: int,
+        nheads: int = 1,
+        group_mask: str = FAM_MASK_GROUP_NULL,
+    ) -> None:
+        super().__init__()
+        self._group_size = group_size
+        self._num_tasks = num_tasks
+        self._nheads = nheads
+        self._group_mask = group_mask
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        seq_offsets: torch.Tensor,
+        num_targets: torch.Tensor,
+    ) -> torch.Tensor:
+        return build_onerank_func_tensor(
+            nheads=self._nheads,
+            seq_offsets=seq_offsets,
+            total_q=x.size(0),
+            num_targets=num_targets,
+            group_size=self._group_size,
+            layout=LAYOUT_BLOCK,
+            group_mask=self._group_mask,
+            num_tasks=self._num_tasks,
+        )
+
+
+def _build_block_func_tensor(
+    layout: List[Tuple[int, int]],
+    group_size: int,
+    num_tasks: int,
+    group_mask: str = FAM_MASK_GROUP_NULL,
+    nheads: int = 1,
+    graph_type: TestGraphType = TestGraphType.NORMAL,
+    num_targets_override: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """Run ``build_onerank_func_tensor`` on an expanded block-layout batch."""
+    seq_lengths = [p + n * group_size for p, n in layout]
+    num_targets = (
+        num_targets_override
+        if num_targets_override is not None
+        else [n * group_size for _, n in layout]
+    )
+    seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
+        torch.tensor(seq_lengths, dtype=torch.int32)
+    )
+    x = torch.zeros(int(sum(seq_lengths)), 1)
+    module = create_test_module(
+        _BuildOneRankBlockFuncTensorWrapper(
+            group_size=group_size,
+            num_tasks=num_tasks,
+            nheads=nheads,
+            group_mask=group_mask,
+        ),
+        graph_type,
+    )
+    func = module(x, seq_offsets, torch.tensor(num_targets, dtype=torch.int32))
+    return func, seq_offsets, max(seq_lengths + [1])
+
+
+@mark_ci_scope("h20", "gpu")
+class OneRankBlockFuncTensorTest(unittest.TestCase):
+    """Verify the NFUNC=5 encoding of the block (``family_tokens``) layout."""
+
+    @parameterized.expand(
+        _xprod([(c[0], c[1] + c[2], c[1], c[3]) for c in _BLOCK_LAYOUT_CASES])
+    )
+    def test_group_null_matches_reference_mask(
+        self,
+        _name: str,
+        graph_type: TestGraphType,
+        group_size: int,
+        num_tasks: int,
+        layout: List[Tuple[int, int]],
+    ) -> None:
+        """Decoded GROUP_NULL tensor == mask built directly from the layout."""
+        func, seq_offsets, padded_len = _build_block_func_tensor(
+            layout, group_size, num_tasks,
+            group_mask=FAM_MASK_GROUP_NULL, graph_type=graph_type,
+        )
+        self.assertEqual(tuple(func.shape), (1, 5, int(seq_offsets[-1])))
+        got = _decode_attn_func_to_mask(func, seq_offsets, padded_len)
+        want = _reference_block_mask(
+            layout, group_size, num_tasks, padded_len, FAM_MASK_GROUP_NULL
+        )
+        torch.testing.assert_close(got[:, 0], want)
+
+    @parameterized.expand(
+        _xprod([(c[0], c[1] + c[2], c[1], c[3]) for c in _BLOCK_LAYOUT_CASES])
+    )
+    def test_task_iso_matches_reference_mask(
+        self,
+        _name: str,
+        graph_type: TestGraphType,
+        group_size: int,
+        num_tasks: int,
+        layout: List[Tuple[int, int]],
+    ) -> None:
+        """Decoded TASK_ISO tensor == mask built directly from the layout."""
+        func, seq_offsets, padded_len = _build_block_func_tensor(
+            layout, group_size, num_tasks,
+            group_mask=FAM_MASK_TASK_ISO, graph_type=graph_type,
+        )
+        got = _decode_attn_func_to_mask(func, seq_offsets, padded_len)
+        want = _reference_block_mask(
+            layout, group_size, num_tasks, padded_len, FAM_MASK_TASK_ISO
+        )
+        torch.testing.assert_close(got[:, 0], want)
+
+    def test_task_iso_task_rows_are_isolated(self) -> None:
+        """Under TASK_ISO, ``t_k`` sees prefix + itself + family block only.
+
+        Never ``t_j`` for ``j != k`` -- the unbundled twin of the paper
+        layout's task isolation, now with the family block shared instead
+        of the candidate token.
+        """
+        prefix_len, num_candidates, K, F = 3, 3, 2, 2
+        group_size = K + F
+        func, seq_offsets, padded_len = _build_block_func_tensor(
+            [(prefix_len, num_candidates)], group_size, K,
+            group_mask=FAM_MASK_TASK_ISO,
+        )
+        mask = _decode_attn_func_to_mask(func, seq_offsets, padded_len)[0, 0]
+        for i in range(num_candidates):
+            base = prefix_len + i * group_size
+            fam = list(range(base + K, base + group_size))
+            for k in range(K):
+                q = base + k
+                visible = mask[q].nonzero().flatten().tolist()
+                self.assertEqual(
+                    visible, list(range(prefix_len)) + [q] + fam
+                )
+
+    def test_task_iso_family_rows_never_see_task_tokens(self) -> None:
+        """A family summary is a pure function of the shared features."""
+        prefix_len, num_candidates, K, F = 4, 2, 3, 2
+        group_size = K + F
+        func, seq_offsets, padded_len = _build_block_func_tensor(
+            [(prefix_len, num_candidates)], group_size, K,
+            group_mask=FAM_MASK_TASK_ISO,
+        )
+        mask = _decode_attn_func_to_mask(func, seq_offsets, padded_len)[0, 0]
+        for i in range(num_candidates):
+            base = prefix_len + i * group_size
+            task_cols = set(range(base, base + K))
+            for slot in range(K, group_size):
+                q = base + slot
+                visible = set(mask[q].nonzero().flatten().tolist())
+                self.assertEqual(
+                    visible,
+                    set(range(prefix_len))
+                    | set(range(base + K, base + group_size)),
+                )
+                self.assertFalse(visible & task_cols)
+
+    def test_group_null_every_row_reads_whole_group(self) -> None:
+        """GROUP_NULL: the whole group is bidirectional, family included."""
+        prefix_len, K, F = 5, 3, 2
+        group_size = K + F
+        func, seq_offsets, padded_len = _build_block_func_tensor(
+            [(prefix_len, 2)], group_size, K, group_mask=FAM_MASK_GROUP_NULL
+        )
+        mask = _decode_attn_func_to_mask(func, seq_offsets, padded_len)[0, 0]
+        for q in range(prefix_len, prefix_len + group_size):
+            self.assertEqual(
+                mask[q].nonzero().flatten().tolist(),
+                list(range(prefix_len))
+                + list(range(prefix_len, prefix_len + group_size)),
+            )
+
+    def test_block_layout_rejects_bad_group_mask(self) -> None:
+        """Unknown mask names fail loudly, not by falling into a branch."""
+        seq_offsets = torch.tensor([0, 5], dtype=torch.int32)
+        with self.assertRaisesRegex(ValueError, "group_mask"):
+            build_onerank_func_tensor(
+                nheads=1,
+                seq_offsets=seq_offsets,
+                total_q=5,
+                num_targets=torch.tensor([5], dtype=torch.int32),
+                group_size=5,
+                layout=LAYOUT_BLOCK,
+                group_mask="FAMILY_MASK_NOPE",
+                num_tasks=3,
+            )
+
+    def test_block_layout_requires_num_tasks(self) -> None:
+        """Without ``K`` the TASK_ISO row split is undefined."""
+        seq_offsets = torch.tensor([0, 5], dtype=torch.int32)
+        for bad in (None, 0, 5):
+            with self.assertRaisesRegex(ValueError, "num_tasks"):
+                build_onerank_func_tensor(
+                    nheads=1,
+                    seq_offsets=seq_offsets,
+                    total_q=5,
+                    num_targets=torch.tensor([5], dtype=torch.int32),
+                    group_size=5,
+                    layout=LAYOUT_BLOCK,
+                    group_mask=FAM_MASK_TASK_ISO,
+                    num_tasks=bad,
+                )
+
+
+class OneRankBlockTokenizerTest(unittest.TestCase):
+    """Verify the ``[t_1..t_K, x^1..x^F]`` block expansion."""
+
+    _FAMILY_DIMS = [3, 2, 4]
+    _FAMILY_IDS = [0, 0, 0, 1, 1, 2, 2, 2, 2]
+
+    def _tokenizer(self) -> OneRankTokenizer:
+        return OneRankTokenizer(
+            num_tasks=3,
+            embedding_dim=8,
+            family_dims=self._FAMILY_DIMS,
+            family_feature_ids=self._FAMILY_IDS,
+        )
+
+    def test_layout_and_group_size(self) -> None:
+        """Block layout: K + F tokens, F projections, F index buffers."""
+        tokenizer = self._tokenizer()
+        self.assertEqual(tokenizer.layout, LAYOUT_BLOCK)
+        self.assertEqual(tokenizer.group_size, 3 + 3)
+        self.assertEqual(tokenizer.num_families, 3)
+        self.assertEqual(tokenizer.family_names, ["family_0", "family_1", "family_2"])
+
+    def test_expansion_matches_projection_definition(self) -> None:
+        """Slot ``K + f`` of the group is exactly ``W_f(gather_f(raw))``."""
+        torch.manual_seed(0)
+        tokenizer = self._tokenizer()
+        raw = torch.randn(2, sum(self._FAMILY_DIMS))
+        out = tokenizer(raw)
+        K = tokenizer.num_tasks
+        for f, d in enumerate(self._FAMILY_DIMS):
+            idx = torch.as_tensor(
+                [j for j, fid in enumerate(self._FAMILY_IDS) if fid == f],
+                dtype=torch.long,
+            )
+            want = tokenizer._family_projs[f](raw[:, idx])
+            for i in range(2):
+                torch.testing.assert_close(out[i * tokenizer.group_size + K + f], want[i])
+        # Task slots are the shared learned queries.
+        for i in range(2):
+            for k in range(K):
+                torch.testing.assert_close(
+                    out[i * tokenizer.group_size + k], tokenizer._task_tokens[k]
+                )
+
+    def test_gradients_flow_through_every_raw_column(self) -> None:
+        """Every raw column feeds exactly one family projection.
+
+        A family id typo that orphaned a column would leave its gradient
+        at zero.
+        """
+        torch.manual_seed(0)
+        tokenizer = self._tokenizer()
+        raw = torch.randn(2, sum(self._FAMILY_DIMS), requires_grad=True)
+        out = tokenizer(raw)
+        (out * torch.randn_like(out)).sum().backward()
+        self.assertTrue(torch.isfinite(raw.grad).all())
+        self.assertFalse((raw.grad == 0).any(dim=0).any())
+
+    @parameterized.expand(
+        [
+            ("id_count_mismatch", {"family_dims": [3, 2], "family_feature_ids": [0, 0, 1]}),
+            ("empty_family", {"family_dims": [3, 0, 2], "family_feature_ids": [0, 0, 0, 2, 1, 1]}),
+            ("id_out_of_range", {"family_dims": [3, 2], "family_feature_ids": [0, 0, 0, 5, 1]}),
+        ]
+    )
+    def test_bad_family_config_raises(
+        self, _name: str, kwargs: Dict[str, object]
+    ) -> None:
+        with self.assertRaises(ValueError):
+            OneRankTokenizer(num_tasks=2, embedding_dim=8, **kwargs)
+
+
+class OneRankBlockComposeOutputTest(unittest.TestCase):
+    """The block-layout transducer output is the first ``K`` slots."""
+
+    def test_block_layout_returns_the_first_k_slots(self) -> None:
+        K, F, D = 3, 2, 4
+        group_size = K + F
+        prefix = [1, 1]
+        candidates = [2, 4]
+        num_targets = [c * group_size for c in candidates]
+        lengths = [p + n for p, n in zip(prefix, num_targets)]
+        total_q = sum(lengths)
+
+        transducer = object.__new__(OneRankHSTUTransducer)
+        object.__setattr__(
+            transducer,
+            "_tokenizer",
+            OneRankTokenizer(
+                num_tasks=K,
+                embedding_dim=D,
+                family_dims=[2, 2],
+                family_feature_ids=[0, 0, 1, 1],
+            ),
+        )
+        object.__setattr__(transducer, "_return_full_embeddings", False)
+        object.__setattr__(transducer, "_is_inference", False)
+        object.__setattr__(transducer, "_kernel", Kernel.PYTORCH)
+
+        class _StubPreprocessor:
+            def interleave_targets(self) -> bool:
+                return False
+
+        class _StubPostprocessor:
+            def __call__(self, seq_embeddings, seq_timestamps):
+                return seq_embeddings
+
+        object.__setattr__(transducer, "_input_preprocessor", _StubPreprocessor())
+        object.__setattr__(transducer, "_output_postprocessor", _StubPostprocessor())
+
+        encoded = (
+            torch.arange(total_q, dtype=torch.float32)
+            .unsqueeze(-1)
+            .expand(-1, D)
+            .contiguous()
+        )
+        timestamps = torch.arange(total_q, dtype=torch.float32)
+
+        out, full = transducer._compose_output(
+            encoded_embeddings=encoded,
+            seq_timestamps=timestamps,
+            seq_lengths=torch.tensor(lengths),
+            seq_offsets=torch.tensor([0, lengths[0], total_q]),
+            max_seq_len=max(lengths),
+            total_uih_len=sum(prefix),
+            total_targets=sum(num_targets),
+            num_targets=torch.tensor(num_targets),
+        )
+
+        # Expected stamp of the task-token row of candidate c, task k,
+        # request b: request start + prefix + c * (K + F) + k -- the first
+        # K slots of each block, not slots 1..K.
+        expected = []
+        start = 0
+        for b in range(2):
+            for c in range(candidates[b]):
+                expected.append(
+                    [
+                        float(start + prefix[b] + c * group_size + k)
+                        for k in range(K)
+                    ]
+                )
+            start += lengths[b]
+        self.assertTrue(
+            torch.equal(out[:, :, 0], torch.tensor(expected)),
+            msg=f"task-slot stamps wrong; got\n{out[:, :, 0]}",
+        )
+        self.assertEqual(out.shape, (sum(candidates), K, D))
+        self.assertIsNone(full)
+
+
+class OneRankBlockSTULayerTest(unittest.TestCase):
+    """Block-layout ``OneRankSTULayer`` construction contracts."""
+
+    _STU_KWARGS = {
+        "embedding_dim": 16,
+        "num_heads": 2,
+        "hidden_dim": 8,
+        "attention_dim": 8,
+    }
+
+    def _build(
+        self,
+        group_size: int = 12,
+        num_tasks: int = 7,
+        group_mask: str = FAM_MASK_TASK_ISO,
+        **overrides: object,
+    ) -> OneRankSTULayer:
+        kwargs: Dict[str, object] = dict(self._STU_KWARGS)
+        kwargs.update(overrides)
+        return OneRankSTULayer(
+            group_size=group_size,
+            layout=LAYOUT_BLOCK,
+            group_mask=group_mask,
+            num_tasks=num_tasks,
+            **kwargs,
+        )
+
+    def test_block_mask_is_noncausal(self) -> None:
+        """Both block masks read future columns; the paper layout does not."""
+        self.assertTrue(self._build().uses_noncausal_func_mask)
+        paper_kwargs: Dict[str, object] = dict(self._STU_KWARGS)
+        paper = OneRankSTULayer(group_size=8, **paper_kwargs)
+        self.assertFalse(paper.uses_noncausal_func_mask)
+
+    def test_cache_signature_separates_layouts_and_masks(self) -> None:
+        """Different layouts / group masks must not share a func tensor."""
+        block_null = self._build(group_mask=FAM_MASK_GROUP_NULL)
+        block_iso = self._build(group_mask=FAM_MASK_TASK_ISO)
+        self.assertNotEqual(
+            block_null.attn_func_static_sig, block_iso.attn_func_static_sig
+        )
+        paper_kwargs: Dict[str, object] = dict(self._STU_KWARGS)
+        paper = OneRankSTULayer(group_size=12, **paper_kwargs)
+        self.assertNotEqual(
+            block_iso.attn_func_static_sig, paper.attn_func_static_sig
+        )
+
+    def test_bad_block_options_are_rejected(self) -> None:
+        """Unknown mask / missing num_tasks fail at construction."""
+        with self.assertRaisesRegex(ValueError, "group_mask"):
+            self._build(group_mask="FAMILY_MASK_NOPE")
+        with self.assertRaisesRegex(ValueError, "num_tasks"):
+            self._build(num_tasks=None)
 
 
 if __name__ == "__main__":

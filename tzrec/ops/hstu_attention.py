@@ -59,6 +59,7 @@ def hstu_mha(
     enable_tma: bool = False,
     attn_func: Optional[torch.Tensor] = None,
     scaling_seqlen: int = -1,
+    func_noncausal: bool = False,
 ) -> torch.Tensor:
     """HSTU multi-head attention with kernel backend dispatch.
 
@@ -89,6 +90,10 @@ def hstu_mha(
         scaling_seqlen: divisor used to scale the attention output inside
             the kernel. ``-1`` (default) falls back to ``max_seq_len`` so
             the behavior matches the legacy code path.
+        func_noncausal: NFUNC path only (CUTLASS) -- lift the kernel window
+            from causal to fully open so the func tensor may attend to
+            columns past the query row. The PYTORCH reference ignores it
+            (its mask decoding already honors arbitrary intervals).
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
@@ -144,6 +149,7 @@ def hstu_mha(
             contextual_seq_len=contextual_seq_len,
             attn_func=attn_func,
             scaling_seqlen=scaling_seqlen,
+            func_noncausal=func_noncausal,
         )
 
     if kernel == Kernel.TRITON:

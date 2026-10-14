@@ -453,6 +453,20 @@ class STULayer(STU):
         """
         return self._sla_k1 > 0 or self._sla_k2 > 0
 
+    @property
+    def uses_noncausal_func_mask(self) -> bool:
+        """Whether the NFUNC func tensor attends to future columns.
+
+        Must be a static Python bool -- it selects branches under fx
+        symbolic trace.  When True (and ``uses_arbitrary_mask`` holds),
+        the CUTLASS kernel window is lifted from causal ``(-1, 0)`` to
+        fully open ``(-1, -1)`` so func intervals may extend past the
+        query row (bidirectional masks, e.g. OneRank's block layout).
+        Subclass hook: the default ``False`` keeps the causal window
+        every existing NFUNC caller (SLA, the paper layout) relies on.
+        """
+        return False
+
     def _build_attn_func(
         self,
         x: torch.Tensor,
@@ -545,6 +559,10 @@ class STULayer(STU):
         if not uses_arbitrary_mask:
             kernel_num_targets = num_targets if self._target_aware else None
             kernel_contextual_seq_len = self._contextual_seq_len
+        # Static bool (not the property call) so fx trace keeps one branch.
+        local_func_noncausal: bool = (
+            uses_arbitrary_mask and self.uses_noncausal_func_mask
+        )
         with record_function("## stu_preprocess_and_attention ##"):
             u, attn_output, k, v = hstu_preprocess_and_attention(
                 x=x,
@@ -571,6 +589,7 @@ class STULayer(STU):
                 enable_tma=self._enable_tma,
                 attn_func=local_attn_func,
                 scaling_seqlen=self._scaling_seqlen,
+                func_noncausal=local_func_noncausal,
             )
 
         self.update_kv_cache(

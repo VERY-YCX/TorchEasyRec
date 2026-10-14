@@ -325,6 +325,7 @@ def hstu_preprocess_and_attention(
     enable_tma: bool = False,
     attn_func: Optional[torch.Tensor] = None,
     scaling_seqlen: int = -1,
+    func_noncausal: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     if not is_fx_tracing():
         torch._assert(max_seq_len > 0, "max_seq_len must be larger than 0")
@@ -419,5 +420,6 @@ def hstu_preprocess_and_attention(
             kernel=kernel,
             attn_func=attn_func,
             scaling_seqlen=scaling_seqlen,
+            func_noncausal=func_noncausal,
         ).view(-1, hidden_dim * num_heads)
     return u, attn_output, k, v

@@ -46,6 +46,7 @@ def cutlass_hstu_mha(
     contextual_seq_len: int = 0,
     attn_func: Optional[torch.Tensor] = None,
     scaling_seqlen: int = -1,
+    func_noncausal: bool = False,
 ) -> torch.Tensor:
     """CUTLASS-based HSTU multi-head attention.
 
@@ -60,9 +61,17 @@ def cutlass_hstu_mha(
       ``(NFUNC + 1) // 2`` disjoint column-intervals per query row. The
       caller is responsible for constructing it (see
       ``build_sla_func_tensor`` for the SLA case). In this mode the
-      kernel forces ``window_size_left=-1, window_size_right=0`` so
+      wrapper pins the kernel window to ``(-1, 0)`` (causal) so
       ``causal`` and ``max_attn_len`` are redundant and must be left at
-      their defaults (``causal=True, max_attn_len=0``).
+      their defaults (``causal=True, max_attn_len=0``). Pass
+      ``func_noncausal=True`` to lift the window to ``(-1, -1)`` so the
+      func tensor may also encode future columns (bidirectional masks,
+      e.g. OneRank's block layout); the kernel then honors the full
+      interval union instead of clipping it to ``col <= row``. The
+      non-causal window requires ``num_targets=None`` and
+      ``contextual_seq_len=0`` -- the kernel rejects context/target
+      masking combined with a non-causal window, and an NFUNC caller
+      encodes those regions in the func tensor itself anyway.
 
     The CUTLASS kernel uses int32 cu_seqlens internally, so the cumulative
     sum ``seq_offsets[-1]`` (total token count in the batch) must fit in
@@ -87,6 +96,10 @@ def cutlass_hstu_mha(
         scaling_seqlen: divisor used to scale the attention output inside
             the kernel. ``-1`` (default) falls back to ``max_seq_len`` so
             the behavior matches the legacy code path.
+        func_noncausal: NFUNC path only -- lift the kernel window from
+            causal ``(-1, 0)`` to fully open ``(-1, -1)`` so the func
+            tensor may attend to columns past the query row. Requires
+            ``num_targets=None`` and ``contextual_seq_len=0``.
 
     Returns:
         output tensor of shape (total, nheads, hidden_dim).
@@ -162,7 +175,18 @@ def cutlass_hstu_mha(
         )
 
     if attn_func is not None:
-        window_size_left, window_size_right = -1, 0
+        if func_noncausal:
+            if num_targets is not None or contextual_seq_len > 0:
+                raise ValueError(
+                    "func_noncausal requires num_targets=None and "
+                    "contextual_seq_len=0; the CUTLASS kernel rejects "
+                    "context/target masking combined with a non-causal "
+                    "window (encode those regions in the func tensor "
+                    "instead)."
+                )
+            window_size_left, window_size_right = -1, -1
+        else:
+            window_size_left, window_size_right = -1, 0
     elif causal:
         if max_attn_len > 0:
             window_size_left, window_size_right = max_attn_len, 0
@@ -174,7 +198,7 @@ def cutlass_hstu_mha(
     if scaling_seqlen == -1:
         scaling_seqlen = max_seq_len
 
-    return hstu_attn_varlen_func(
+    out = hstu_attn_varlen_func(
         q,
         k,
         v,
@@ -194,3 +218,53 @@ def cutlass_hstu_mha(
         has_drab=False,
         func=attn_func,
     )
+    # ABI-patched fn5 kernel wheel: the output TensorImpl carries a stale
+    # numel_ cache (the T5-built kernel writes the cache at a field offset
+    # that maps onto different storage under torch 2.11), so downstream
+    # view()/flatten()/numel() see a garbage count (2**48 | true_numel)
+    # while sizes/strides read fine. Rebuilding the view metadata via
+    # as_strided is zero-copy and autograd-transparent (verified: fwd loss
+    # and all input grads bit-identical vs the clone path).
+    if out.dim() == 3:
+        out = torch.as_strided(out, out.shape, out.stride(), out.storage_offset())
+    return out
+
+
+# ---- ABI-patched fn5 kernel wheel: stale-numel metadata guard ----------------
+# The T5-built kernel writes some TensorImpl field at an offset that maps
+# onto 2.11's numel_ for the tensors it *constructs* (fwd out, bwd
+# dq/dk/dv/dRab), so numel() reads 2**48 | true_numel while sizes/strides
+# stay correct; any downstream view()/flatten()/reshape() then dies with
+# "shape is invalid for input of size 281474976710656...".  The fwd output
+# is purified at the return above; the backward outputs are produced inside
+# HstuAttnVarlenFunc.backward, so patch that staticmethod once at import
+# time (module load precedes any graph construction) to rebuild the view
+# metadata of every tensor gradient it returns.  as_strided is zero-copy
+# and autograd-transparent (verified: fwd loss and all input grads
+# bit-identical vs the clone path).
+def _purify_meta(t: "torch.Tensor") -> "torch.Tensor":
+    if isinstance(t, torch.Tensor) and t.dim() >= 1:
+        return torch.as_strided(t, t.shape, t.stride(), t.storage_offset())
+    return t
+
+
+try:
+    from hstu.cuda_hstu_attention import HstuAttnVarlenFunc as _HstuFn
+
+    if not getattr(_HstuFn, "_tzrec_numel_purified", False):
+        # plain function either way: bare `def backward` or @staticmethod
+        # both surface as a function on class attribute access.
+        _orig_backward = getattr(
+            _HstuFn.backward, "__func__", None
+        ) or _HstuFn.backward
+
+        def _purified_backward(ctx, dout, *args):  # noqa: ANN001, ANN202
+            grads = _orig_backward(ctx, dout, *args)
+            if isinstance(grads, tuple):
+                return tuple(_purify_meta(g) for g in grads)
+            return _purify_meta(grads)
+
+        _HstuFn.backward = staticmethod(_purified_backward)
+        _HstuFn._tzrec_numel_purified = True
+except Exception as e:  # pragma: no cover - CPU images
+    logger.debug("HstuAttnVarlenFunc backward purify not applied: %s", e)

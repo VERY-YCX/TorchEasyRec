@@ -33,6 +33,19 @@ HSTU_ARBITRARY_NFUNC = 5
 # room for SLA's two intervals before it starts padding.
 assert HSTU_ARBITRARY_NFUNC % 2 == 1 and HSTU_ARBITRARY_NFUNC >= 3
 
+# Candidate-group token layouts understood by ``build_onerank_func_tensor``.
+# The strings are the proto-agnostic vocabulary shared with
+# ``OneRankTokenizer`` / ``OneRankSTULayer``.
+LAYOUT_PAPER = "LAYOUT_PAPER"
+LAYOUT_BLOCK = "LAYOUT_BLOCK"
+LAYOUTS = (LAYOUT_PAPER, LAYOUT_BLOCK)
+
+# Visibility strategies inside a family-tokenized (block-layout) group;
+# values are the ``OneRankFamilyTokenMask`` proto enum names.
+FAM_MASK_GROUP_NULL = "FAMILY_MASK_GROUP_NULL"
+FAM_MASK_TASK_ISO = "FAMILY_MASK_TASK_ISO"
+_FAM_MASKS = (FAM_MASK_GROUP_NULL, FAM_MASK_TASK_ISO)
+
 
 def build_sla_func_tensor(
     nheads: int,
@@ -158,8 +171,11 @@ def build_onerank_func_tensor(
     num_targets: torch.Tensor,
     group_size: int,
     device: Optional[torch.device] = None,
+    layout: str = LAYOUT_PAPER,
+    group_mask: str = FAM_MASK_GROUP_NULL,
+    num_tasks: Optional[int] = None,
 ) -> torch.Tensor:
-    """Build the arbitrary-mask func tensor for the OneRank paper layout.
+    """Build the arbitrary-mask func tensor for the OneRank group layout.
 
     Same encoding as :func:`build_sla_func_tensor`: shape
     ``(nheads, HSTU_ARBITRARY_NFUNC, total_q)`` int32, jagged along
@@ -197,6 +213,28 @@ def build_onerank_func_tensor(
       ``t_k``, splitting its visible set into ``[0, H_b)``, ``{e^C_i}``
       and ``{t_k}`` -- one interval each, no replicas required.
 
+    The block layout (``LAYOUT_BLOCK``, the ``family_tokens`` probe) drops
+    the standalone candidate token instead: a group is
+    ``[t_1..t_K, x^1..x^F]`` with ``group_size = K + F``, the candidate's
+    raw embedding entering through the per-family projections
+    ``x^f = W_f(e^C)``.  ``slot`` then means ``0..K-1`` -> task tokens and
+    ``K..K+F-1`` -> family tokens, and ``group_mask`` picks the
+    visibility pattern (``G`` = the group's first column,
+    ``gs = group_size``):
+
+    * ``FAM_MASK_GROUP_NULL``: every group row reads
+      ``(H_b, G, G + gs, G + gs, G + gs)`` -- prefix plus the whole
+      group, fully bidirectional inside the group and invisible across
+      groups.  Two live intervals, so this mask also runs on an
+      ``NFUNC == 3`` wheel;
+    * ``FAM_MASK_TASK_ISO``: spends the ``NFUNC == 5`` budget to unbundle
+      task isolation from family sharing.  Task row ``t_k`` reads
+      ``(H_b, p, p + 1, G + K, G + gs)`` -- prefix, itself and the family
+      block, never ``t_j`` for ``j != k``; family rows read
+      ``(H_b, G + K, G + gs, G + gs, G + gs)`` -- prefix plus the family
+      block only, so a family summary stays a pure function of the
+      shared features and never observes any task state.
+
     Args:
         nheads: number of attention heads.
         seq_offsets: cumulative sequence offsets ``(B+1,)`` of the
@@ -205,18 +243,42 @@ def build_onerank_func_tensor(
             taken from the caller's tensor metadata to avoid a D->H sync.
         num_targets: **expanded** per-sample target counts ``(B,)``, i.e.
             ``candidates * group_size``.
-        group_size: tokens per candidate group, ``num_tasks + 1``.
+        group_size: tokens per candidate group, ``num_tasks + 1`` in the
+            paper layout, ``num_tasks + num_families`` in the block layout.
         device: target device (inferred from ``seq_offsets`` if None).
+        layout: :data:`LAYOUT_PAPER` (default, ``[e^C_i, t_1..t_K]``) or
+            :data:`LAYOUT_BLOCK` (``[t_1..t_K, x^1..x^F]``, the
+            ``family_tokens`` probe).
+        group_mask: block layout only; one of :data:`FAM_MASK_GROUP_NULL`
+            (every group row reads the whole group -- bidirectional) or
+            :data:`FAM_MASK_TASK_ISO` (a task row reads itself plus the
+            family block, family rows read the family block).
+        num_tasks: number of task tokens ``K``; required (and must satisfy
+            ``1 <= num_tasks < group_size``) in the block layout, ignored
+            otherwise.
 
     Returns:
         func tensor of shape ``(nheads, HSTU_ARBITRARY_NFUNC, total_q)``,
         dtype int32, as a strided view (stride 0 on the head dim).
     """
+    if layout not in LAYOUTS:
+        raise ValueError(f"layout must be one of {LAYOUTS}; got {layout!r}")
     if group_size < 2:
         raise ValueError(
             f"group_size must be at least 2 (candidate token + one task "
             f"token, i.e. num_tasks + 1); got {group_size}"
         )
+    if layout == LAYOUT_BLOCK:
+        if group_mask not in _FAM_MASKS:
+            raise ValueError(
+                f"group_mask must be one of {_FAM_MASKS}; got {group_mask!r}"
+            )
+        if num_tasks is None or not (1 <= num_tasks < group_size):
+            raise ValueError(
+                f"the block layout requires 1 <= num_tasks < group_size "
+                f"(K task tokens + F >= 1 family tokens); got "
+                f"num_tasks={num_tasks}, group_size={group_size}"
+            )
     if device is None:
         device = seq_offsets.device
     # The tensor-plumbing below deliberately mirrors build_sla_func_tensor:
@@ -241,24 +303,48 @@ def build_onerank_func_tensor(
     prefix_boundary = torch.clamp(L - T, min=0)
 
     is_prefix = pos_local < prefix_boundary
-    # Slot inside the candidate group: 0 -> candidate token e^C_i,
-    # 1..K -> task tokens t_1..t_K.  torch.remainder takes the divisor's
-    # sign, so with a positive group_size the slot is non-negative even on
-    # prefix rows, where the value is meaningless but those rows are
-    # selected away below.
+    # Slot inside the candidate group.  Paper layout: 0 -> candidate
+    # token e^C_i, 1..K -> task tokens t_1..t_K.  Block layout: 0..K-1 ->
+    # task tokens, K..K+F-1 -> family tokens.  torch.remainder takes the
+    # divisor's sign, so with a positive group_size the slot is
+    # non-negative even on prefix rows, where the value is meaningless
+    # but those rows are selected away below.
     slot = torch.remainder(pos_local - prefix_boundary, group_size)
-    is_task_token = slot >= 1
     # First column of the row's own group; on prefix rows it is unused.
     group_base = pos_local - slot
 
     causal = pos_local + 1
-    # Interval 1 covers exactly the candidate column {base} for both row
-    # kinds; interval 2 adds the task token's own column only on task rows
-    # (candidate rows leave it empty: min == max).
-    group_col_min0 = group_base
-    group_col_max1 = group_base + 1
-    self_col_min1 = torch.where(is_task_token, pos_local, group_col_max1)
-    self_col_max2 = torch.where(is_task_token, causal, group_col_max1)
+    if layout == LAYOUT_PAPER:
+        # Interval 1 covers exactly the candidate column {base} for both
+        # row kinds; interval 2 adds the task token's own column only on
+        # task rows (candidate rows leave it empty: min == max).
+        is_task_token = slot >= 1
+        group_col_min0 = group_base
+        group_col_max1 = group_base + 1
+        self_col_min1 = torch.where(is_task_token, pos_local, group_col_max1)
+        self_col_max2 = torch.where(is_task_token, causal, group_col_max1)
+    else:
+        # LAYOUT_BLOCK; the validation above pinned group_mask to
+        # _FAM_MASKS and guaranteed a usable num_tasks.
+        if group_mask == FAM_MASK_GROUP_NULL:
+            # Whole-group bidirectional: every row (task or family) reads
+            # [G, G + gs) via interval 1 and leaves interval 2 empty.
+            group_col_min0 = group_base
+            group_col_max1 = group_base + group_size
+            self_col_min1 = group_col_max1
+            self_col_max2 = group_col_max1
+        else:  # FAM_MASK_TASK_ISO
+            # Task rows: {p} via interval 1, family block [G + K, G + gs)
+            # via interval 2.  Family rows: family block via interval 1,
+            # interval 2 parked empty -- never a duplicate of columns
+            # already visible through interval 1.
+            is_task_row = slot < num_tasks
+            fam_col_min = group_base + num_tasks
+            fam_col_max = group_base + group_size
+            group_col_min0 = torch.where(is_task_row, pos_local, fam_col_min)
+            group_col_max1 = torch.where(is_task_row, causal, fam_col_max)
+            self_col_min1 = torch.where(is_task_row, fam_col_min, fam_col_max)
+            self_col_max2 = torch.where(is_task_row, fam_col_max, fam_col_max)
 
     col_max0 = torch.where(is_prefix, causal, prefix_boundary)
     col_min0 = torch.where(is_prefix, causal, group_col_min0)

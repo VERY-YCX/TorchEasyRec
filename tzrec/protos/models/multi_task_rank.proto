@@ -143,9 +143,52 @@ message OneRankCrossTaskHead {
     repeated string hybrid_chain_task_names = 6;
 }
 
+// Visibility of the task / family tokens inside a family-tokenized
+// candidate group (see OneRankFamilyTokens).
+enum OneRankFamilyTokenMask {
+    // Every group row -- task or family -- reads the whole group block
+    // (bidirectional): [0, H) u [G, G + K + F).
+    FAMILY_MASK_GROUP_NULL = 0;
+    // Paper-layout task isolation lifted onto the family layout: a task
+    // token reads itself plus the family block, never another task token
+    // -- [0, H) u {t_k} u [G + K, G + K + F); family rows read the family
+    // block -- [0, H) u [G + K, G + K + F).
+    FAMILY_MASK_TASK_ISO = 1;
+}
+
+// Family-tokenized candidate groups (Layer 2 probe; see
+// ONERANK_LAYER2_DESIGN.md): replace the paper's [e^C_i, t_1..t_K]
+// group with a block layout of K task tokens followed by F family
+// tokens (K + F tokens per candidate).  Each family token
+// x^f = W_f(gather_f(raw candidate features)) is a first-hand family
+// representation projected to the STU embedding dim *inside* the HSTU
+// attention path: the Layer 1 bypass routed family segments straight to
+// the scorer around the trunk, this arm instead gives the family
+// structure attention-level visibility (RankMixer-style semantic
+// tokenization, borrowed for its granularity only -- cross-token mixing
+// stays HSTU attention).  The task axis is carried by the task tokens'
+// attention over the family tokens, so the family projections are shared
+// across tasks.
+message OneRankFamilyTokens {
+    // family id (0 .. len(family_names)-1) of each candidate-group feature,
+    // in embedding order; exactly one entry per feature of the "candidate"
+    // feature group -- same convention as the fork-line score_group_ffn.
+    repeated uint32 feature_family_ids = 1;
+    // human-readable family names indexed by the ids above; kept for
+    // reporting the learned family projections against the permutation-FI
+    // table
+    repeated string family_names = 2;
+    // group visibility strategy; see OneRankFamilyTokenMask.
+    optional OneRankFamilyTokenMask group_mask = 3 [default = FAMILY_MASK_GROUP_NULL];
+}
+
 message OneRankConfig {
     optional OneRankSituationDiscernment situation_discernment = 2;
     optional OneRankCrossTaskHead cross_task_head = 3;
+    // family-tokenized candidate groups (Layer 2 probe): block layout of
+    // K task tokens + F family tokens per candidate; restructures how
+    // candidates enter the attention path.
+    optional OneRankFamilyTokens family_tokens = 8;
     // scoring function of the head, one of "dot_product", "bilinear"
     // or "mlp"; validated at head construction (see
     // docs/source/models/dlrm_hstu_onerank.md for when to move off the

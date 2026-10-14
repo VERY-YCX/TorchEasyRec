@@ -34,7 +34,7 @@ a few dozen); it does not scale to full-corpus candidate sets.
 """
 
 import math
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -43,6 +43,11 @@ from tzrec.modules.gr.hstu_transducer import HSTUTransducer
 from tzrec.modules.gr.stu import STU, STULayer
 from tzrec.modules.utils import BaseModule
 from tzrec.ops.hstu_attention_utils import (
+    _FAM_MASKS,
+    FAM_MASK_GROUP_NULL,
+    LAYOUT_BLOCK,
+    LAYOUT_PAPER,
+    LAYOUTS,
     STUTruncationPlan,
     build_onerank_func_tensor,
 )
@@ -78,12 +83,35 @@ torch.fx.wrap(_fx_check_max_seq_len)
 
 
 class OneRankTokenizer(BaseModule):
-    """Expands each candidate into its ``[candidate, t_1..t_K]`` group.
+    """Expands each candidate into its token group.
+
+    Two layouts, selected by whether family info is given:
+
+    - paper (default): ``[e^C_i, t_1..t_K]`` (``K + 1`` tokens);
+      ``forward`` receives the preprocessor's projected candidate
+      embeddings.
+    - block (``family_dims`` given): ``[t_1..t_K, x^1..x^F]`` (``K + F``
+      tokens); ``forward`` receives the *raw* candidate features,
+      because family boundaries live in the raw feature layout.  Each
+      family token ``x^f = W_f(gather_f(raw))`` is projected to the STU
+      embedding dim by a per-family ``Linear`` shared across tasks -- the
+      task axis is carried by the task tokens' attention over the family
+      tokens, not by the projections.
 
     Args:
         num_tasks (int): number of task tokens ``K``.
         embedding_dim (int): STU embedding dimension.
         is_inference (bool): whether to run in inference mode.
+        family_dims (Optional[List[int]]): dimension of each family's
+            slice of the raw candidate features; ``None`` selects the
+            paper layout.
+        family_feature_ids (Optional[List[int]]): family id of each
+            *dimension* of the raw candidate features (the model layer
+            expands the proto's per-feature ids); required iff
+            ``family_dims`` is given.
+        family_names (Optional[List[str]]): human-readable family names,
+            kept only for reading the learned projections off a trained
+            checkpoint.
     """
 
     def __init__(
@@ -91,6 +119,9 @@ class OneRankTokenizer(BaseModule):
         num_tasks: int,
         embedding_dim: int,
         is_inference: bool = False,
+        family_dims: Optional[List[int]] = None,
+        family_feature_ids: Optional[List[int]] = None,
+        family_names: Optional[List[str]] = None,
     ) -> None:
         super().__init__(is_inference=is_inference)
         if num_tasks <= 0:
@@ -102,6 +133,62 @@ class OneRankTokenizer(BaseModule):
                 0.0, 1.0 / math.sqrt(embedding_dim)
             )
         )
+        if (family_dims is None) != (family_feature_ids is None):
+            raise ValueError(
+                "family_dims and family_feature_ids must be given together "
+                f"(got family_dims={'set' if family_dims else 'None'}, "
+                f"family_feature_ids={'set' if family_feature_ids else 'None'})"
+            )
+        self._family_names: Optional[List[str]] = None
+        self._family_dims: Optional[List[int]] = None
+        if family_dims is not None:
+            fam_dims = [int(d) for d in family_dims]
+            fam_ids = [int(i) for i in family_feature_ids]
+            n_fam = len(fam_dims)
+            if n_fam <= 0:
+                raise ValueError("family_dims must not be empty")
+            if any(d <= 0 for d in fam_dims):
+                raise ValueError(
+                    f"every family must own at least one dimension; got "
+                    f"family_dims={fam_dims}"
+                )
+            if len(fam_ids) != sum(fam_dims):
+                raise ValueError(
+                    f"family_feature_ids has {len(fam_ids)} entries but "
+                    f"family_dims sum to {sum(fam_dims)}: one id per raw "
+                    f"candidate dimension is required"
+                )
+            if min(fam_ids, default=0) < 0 or max(fam_ids, default=-1) >= n_fam:
+                raise ValueError(
+                    f"family ids must lie in [0, {n_fam}); got ids spanning "
+                    f"[{min(fam_ids)}, {max(fam_ids)}]"
+                )
+            # Per-family column indices of the raw features: family f
+            # owns a possibly discontiguous set of columns (FI families
+            # interleave in embedding order), so each family gets an index
+            # buffer and forward gathers with one index_select per family
+            # -- single-op, fx-friendly.  No cached index-tensor list: the
+            # buffer references would go stale across .to(device)/DMP, so
+            # forward looks the buffers up live (see _forward_block).
+            indices = [[] for _ in range(n_fam)]
+            for j, fid in enumerate(fam_ids):
+                indices[fid].append(j)
+            for f, idx in enumerate(indices):
+                self.register_buffer(
+                    f"_family_idx_{f}", torch.as_tensor(idx, dtype=torch.long)
+                )
+            self._family_dims = fam_dims
+            self._family_names = list(family_names or [
+                f"family_{i}" for i in range(n_fam)
+            ])
+            if len(self._family_names) != n_fam:
+                raise ValueError(
+                    f"family_names has {len(self._family_names)} entries "
+                    f"but family_dims imply {n_fam} families"
+                )
+            self._family_projs = torch.nn.ModuleList(
+                torch.nn.Linear(d, embedding_dim) for d in fam_dims
+            )
 
     @property
     def num_tasks(self) -> int:
@@ -109,8 +196,25 @@ class OneRankTokenizer(BaseModule):
         return self._num_tasks
 
     @property
+    def layout(self) -> str:
+        """Token layout: :data:`LAYOUT_PAPER` or :data:`LAYOUT_BLOCK`."""
+        return LAYOUT_BLOCK if self._family_dims is not None else LAYOUT_PAPER
+
+    @property
+    def num_families(self) -> Optional[int]:
+        """Number of family tokens ``F``; ``None`` in the paper layout."""
+        return None if self._family_dims is None else len(self._family_dims)
+
+    @property
+    def family_names(self) -> Optional[List[str]]:
+        """Family names, for reading learned projections; ``None`` if off."""
+        return self._family_names
+
+    @property
     def group_size(self) -> int:
-        """Tokens per candidate group, ``K + 1``."""
+        """Tokens per candidate group: ``K + 1`` paper, ``K + F`` block."""
+        if self._family_dims is not None:
+            return self._num_tasks + len(self._family_dims)
         return self._num_tasks + 1
 
     def forward(self, target_embeddings: torch.Tensor) -> torch.Tensor:
@@ -119,11 +223,22 @@ class OneRankTokenizer(BaseModule):
         Args:
             target_embeddings (torch.Tensor): candidate embeddings
                 ``(total_targets, D)``, jagged and grouped by request.
+                ``D`` is the preprocessor output dim in the paper layout,
+                the *raw* candidate feature dim (e.g. 736) in the block
+                layout.
 
         Returns:
-            torch.Tensor: ``(total_targets * (K + 1), D)``, each candidate
-                replaced in place by ``[e^C_i, t_1, ..., t_K]``.
+            torch.Tensor: ``(total_targets * group_size, D_out)``, each
+                candidate replaced in place by its token group --
+                ``[e^C_i, t_1, ..., t_K]`` paper, or
+                ``[t_1, ..., t_K, x^1, ..., x^F]`` block (``D_out`` is
+                the STU embedding dim in both).
         """
+        if self._family_dims is not None:
+            return self._forward_block(target_embeddings)
+        return self._forward_paper(target_embeddings)
+
+    def _forward_paper(self, target_embeddings: torch.Tensor) -> torch.Tensor:
         dim = target_embeddings.size(-1)
         tokens = self._task_tokens.to(target_embeddings.dtype)
         tokens = tokens.unsqueeze(0).expand(target_embeddings.size(0), -1, -1)
@@ -133,23 +248,82 @@ class OneRankTokenizer(BaseModule):
             -1, dim
         )
 
+    def _forward_block(self, candidate_raw: torch.Tensor) -> torch.Tensor:
+        """``[t_1..t_K, x^1..x^F]`` per candidate, block layout."""
+        # family tokens: gather each family's (discontiguous) columns and
+        # project them to the STU dim.  Buffer lookups are live
+        # (self._buffers[...]) so .to(device)/DMP cannot leave a stale
+        # index tensor behind.
+        fam_tokens = []
+        for f in range(len(self._family_dims)):
+            seg = torch.index_select(
+                candidate_raw, 1, self._buffers[f"_family_idx_{f}"]
+            )
+            fam_tokens.append(self._family_projs[f](seg))
+        # (total_targets, F, D)
+        fam_tokens = torch.stack(fam_tokens, dim=1)
+        # task queries, broadcast to every candidate; the family tokens
+        # follow, so slot k in [0, K) is t_k and the readout keeps
+        # ``_compose_output``'s task-slot convention.
+        tokens = self._task_tokens.to(candidate_raw.dtype)
+        tokens = tokens.unsqueeze(0).expand(candidate_raw.size(0), -1, -1)
+        dim = self._embedding_dim
+        return torch.cat([tokens, fam_tokens], dim=1).reshape(-1, dim)
+
 
 class OneRankSTULayer(STULayer):
     """``STULayer`` masked with the OneRank group layout instead of SLA.
 
     Args:
-        group_size (int): tokens per candidate group, ``num_tasks + 1``.
+        group_size (int): tokens per candidate group, ``num_tasks + 1``
+            in the paper layout, ``num_tasks + num_families`` in the
+            block layout.
+        layout (str): :data:`LAYOUT_PAPER` (default) or
+            :data:`LAYOUT_BLOCK` (the ``family_tokens`` probe).
+        group_mask (str): block layout only; the in-group visibility
+            strategy, one of the :data:`FAM_MASK_GROUP_NULL` /
+            :data:`FAM_MASK_TASK_ISO` constants (see
+            :func:`build_onerank_func_tensor`).
+        num_tasks (Optional[int]): number of task tokens ``K``; required
+            in the block layout (the ``FAM_MASK_TASK_ISO`` mask splits
+            task rows from family rows at slot ``K``), ignored otherwise.
         **kwargs: forwarded verbatim to :class:`STULayer`.
     """
 
-    def __init__(self, group_size: int, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        group_size: int,
+        layout: str = LAYOUT_PAPER,
+        group_mask: str = FAM_MASK_GROUP_NULL,
+        num_tasks: Optional[int] = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
+        if layout not in LAYOUTS:
+            raise ValueError(f"layout must be one of {LAYOUTS}; got {layout!r}")
         if group_size < 2:
             raise ValueError(
                 f"group_size must be at least 2 (candidate token + one task "
                 f"token, i.e. num_tasks + 1); got {group_size}"
             )
+        if layout == LAYOUT_BLOCK:
+            # build_onerank_func_tensor re-validates on every call; checked
+            # here too so a bad config fails at construction, not at the
+            # first forward.
+            if group_mask not in _FAM_MASKS:
+                raise ValueError(
+                    f"group_mask must be one of {_FAM_MASKS}; got {group_mask!r}"
+                )
+            if num_tasks is None or not (1 <= num_tasks < group_size):
+                raise ValueError(
+                    f"the block layout requires 1 <= num_tasks < group_size "
+                    f"(K task tokens + F >= 1 family tokens); got "
+                    f"num_tasks={num_tasks}, group_size={group_size}"
+                )
         self._group_size: int = group_size
+        self._layout: str = layout
+        self._group_mask: str = group_mask
+        self._group_num_tasks: Optional[int] = num_tasks
         if self._sla_k1 > 0 or self._sla_k2 > 0:
             raise ValueError(
                 f"OneRank builds its own NFUNC mask and cannot also apply SLA; "
@@ -185,13 +359,33 @@ class OneRankSTULayer(STULayer):
         return True
 
     @property
+    def uses_noncausal_func_mask(self) -> bool:
+        """Whether this layer's func tensor reads future columns.
+
+        The paper layout stays causal: every interval ends at or before
+        the query row (``{e^C_i}`` sits before ``t_k``).  Both block
+        masks look ahead -- ``FAM_MASK_GROUP_NULL`` reads the whole group,
+        ``FAM_MASK_TASK_ISO`` reads the trailing family block -- so the
+        CUTLASS attention window must be lifted from ``(-1, 0)`` to
+        ``(-1, -1)`` or the kernel would silently clip the family
+        columns out of every group row.
+        """
+        return self._layout == LAYOUT_BLOCK
+
+    @property
     def attn_func_static_sig(self) -> str:
         """OneRank NFUNC cache key.
 
-        Prefixed so it can never collide with ``STULayer``'s SLA signature
-        in a mixed stack.
+        Prefixed so it can never collide with ``STULayer``'s SLA
+        signature in a mixed stack.  ``layout`` and ``group_mask`` must
+        be part of the key: the func tensor is cached across layers
+        keyed on this string, and two OneRank layers with different
+        token layouts or in-group masks must not share one tensor.
         """
-        return f"onerank:{self._group_size}:{self._num_heads}"
+        return (
+            f"onerank:{self._layout}:{self._group_size}:"
+            f"{self._num_heads}:{self._group_mask}:attn"
+        )
 
     def _build_attn_func(
         self,
@@ -211,6 +405,9 @@ class OneRankSTULayer(STULayer):
             total_q=x.size(0),
             num_targets=num_targets,
             group_size=self._group_size,
+            layout=self._layout,
+            group_mask=self._group_mask,
+            num_tasks=self._group_num_tasks,
         )
 
     def truncate_input(
@@ -254,7 +451,11 @@ class OneRankHSTUTransducer(HSTUTransducer):
     the input preprocessor plus positional encoding, and only then are the
     candidates replaced by their groups.  Task tokens therefore carry no
     positional / time encoding (they are pure learned queries) while the
-    candidate token keeps the encoding of the candidate it heads.
+    candidate token keeps the encoding of the candidate it heads.  In the
+    block layout there is no candidate token: the family tokens are
+    projected from the *raw* candidate features inside the tokenizer (see
+    :class:`OneRankTokenizer`), so no member of the group carries a
+    positional encoding.
 
     Output is ``(total_targets, K, D)`` -- the per-candidate per-task
     representation ``r^i_k`` of the paper -- instead of the baseline's
@@ -268,6 +469,19 @@ class OneRankHSTUTransducer(HSTUTransducer):
             requests that exceed it fail with a clear error instead of
             silently overflowing the static max sequence length the
             jagged kernels were autotuned for.
+        group_mask (str): block layout only; the in-group visibility
+            strategy forwarded to every :class:`OneRankSTULayer` (see
+            :func:`build_onerank_func_tensor`).
+        family_dims (Optional[List[int]]): dimension of each family's
+            slice of the raw candidate features; given -> the block
+            layout (``family_tokens``, Layer 2 probe), ``None`` -> the
+            paper layout.  Must sum to ``target_embedding_dim``.
+        family_feature_ids (Optional[List[int]]): family id of each
+            *dimension* of the raw candidate features (the model layer
+            expands the proto's per-feature ids); required iff
+            ``family_dims`` is given.
+        family_names (Optional[List[str]]): human-readable family names,
+            kept for reading the learned projections off a checkpoint.
         **kwargs: forwarded verbatim to :class:`HSTUTransducer`.
     """
 
@@ -275,17 +489,44 @@ class OneRankHSTUTransducer(HSTUTransducer):
         self,
         num_task_tokens: int,
         max_seq_len: int,
+        group_mask: str = FAM_MASK_GROUP_NULL,
+        family_dims: Optional[List[int]] = None,
+        family_feature_ids: Optional[List[int]] = None,
+        family_names: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> None:
         if num_task_tokens <= 0:
             raise ValueError(f"num_task_tokens must be positive; got {num_task_tokens}")
         if max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be positive; got {max_seq_len}")
+        if (family_dims is None) != (family_feature_ids is None):
+            raise ValueError(
+                "family_dims and family_feature_ids must be given together"
+            )
+        if family_dims is not None:
+            if group_mask not in _FAM_MASKS:
+                raise ValueError(
+                    f"group_mask must be one of {_FAM_MASKS}; got {group_mask!r}"
+                )
+            raw_dim = int(kwargs.get("target_embedding_dim", 0))
+            if raw_dim <= 0 or sum(family_dims) != raw_dim:
+                raise ValueError(
+                    f"family_dims must sum to the raw candidate feature "
+                    f"dim (target_embedding_dim): sum(family_dims)="
+                    f"{sum(family_dims)}, target_embedding_dim={raw_dim}"
+                )
         self._max_seq_len: int = max_seq_len
         stu = dict(kwargs.pop("stu"))
         # Routed through the stu dict because `_build_stu_layer` runs inside
         # `super().__init__()`, before subclass attributes exist.
-        stu["group_size"] = num_task_tokens + 1
+        if family_dims is not None:
+            stu["group_size"] = num_task_tokens + len(family_dims)
+            stu["layout"] = LAYOUT_BLOCK
+            stu["group_mask"] = group_mask
+            stu["num_tasks"] = num_task_tokens
+        else:
+            stu["group_size"] = num_task_tokens + 1
+            stu["layout"] = LAYOUT_PAPER
         # The paper layout spends all three func-tensor column intervals
         # on `prefix + own group`, so contextual tokens must be ordinary
         # causal prefix. Resolve the `-1` sentinel ("inherit from the
@@ -331,6 +572,9 @@ class OneRankHSTUTransducer(HSTUTransducer):
             num_tasks=num_task_tokens,
             embedding_dim=stu["embedding_dim"],
             is_inference=self._is_inference,
+            family_dims=family_dims,
+            family_feature_ids=family_feature_ids,
+            family_names=family_names,
         )
 
     def _build_stu_layer(self, stu: Dict[str, Any]) -> STU:
@@ -385,7 +629,29 @@ class OneRankHSTUTransducer(HSTUTransducer):
                 kernel=self.kernel(),
             )
 
-            expanded_embeddings = self._tokenizer(target_embeddings)
+            if self._tokenizer.layout == LAYOUT_BLOCK:
+                # Family boundaries live in the *raw* candidate feature
+                # layout (the FI families interleave in embedding order),
+                # so the block tokenizer consumes the pre-preprocessor
+                # candidate features from grouped_features and the
+                # preprocessor's projected target segment above is
+                # dropped: its parameters keep serving the UIH prefix.
+                # Same jagged candidate order as target_embeddings (the
+                # input preprocessor reads this very key), so the
+                # timestamps split above stay aligned.
+                tokens = self._tokenizer(
+                    grouped_features["candidate.sequence"]
+                )
+                # The .to() anchors the dtype to the embedding pipeline:
+                # under AMP the dense candidate features arrive in bf16
+                # (so the projected family tokens are bf16 too) while the
+                # UIH prefix stays fp32, and concat_2D_jagged requires
+                # both sides to match (triton: "Mismatched type for
+                # in_ptrs"). The paper path needs no cast -- its input IS
+                # target_embeddings. No-op outside AMP.
+                expanded_embeddings = tokens.to(target_embeddings.dtype)
+            else:
+                expanded_embeddings = self._tokenizer(target_embeddings)
             # Every token of a group inherits the candidate's timestamp, so
             # the output postprocessor's time features are unchanged.
             expanded_timestamps = target_timestamps.repeat_interleave(group_size, dim=0)
@@ -456,9 +722,20 @@ class OneRankHSTUTransducer(HSTUTransducer):
             total_targets=total_targets,
             num_targets=num_targets,
         )
-        # (total_targets * (K + 1), D) -> (total_targets, K, D): slots
-        # 1..K of each group carry the task tokens' outputs, r^i_k.
+        # (total_targets * group_size, D) -> (total_targets, K, D): which
+        # slots hold the task tokens' outputs r^i_k depends on the layout.
         dim = group_embeddings.size(-1)
+        if self._tokenizer.layout == LAYOUT_BLOCK:
+            # Block: the first K slots of each [t_1..t_K, x^1..x^F] group;
+            # the family-token outputs are the trunk's internal
+            # cross-feature carriers, not read out.
+            return (
+                group_embeddings.view(-1, self._tokenizer.group_size, dim)[
+                    :, : self._tokenizer.num_tasks, :
+                ],
+                full,
+            )
+        # Paper: slots 1..K of each [e^C_i, t_1..t_K] group.
         return (
             group_embeddings.view(-1, self._tokenizer.group_size, dim)[:, 1:, :],
             full,

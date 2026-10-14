@@ -33,6 +33,7 @@ from tzrec.models.dlrm_hstu_onerank import DlrmHSTUOneRank
 from tzrec.models.model import TrainWrapper
 from tzrec.models.rank_model import TARGET_REPEAT_INTERLEAVE_KEY
 from tzrec.ops import Kernel
+from tzrec.ops.hstu_attention_utils import LAYOUT_BLOCK
 from tzrec.protos import (
     feature_pb2,
     loss_pb2,
@@ -129,6 +130,7 @@ def _model_config(
     task_bias_init: Optional[List[float]] = None,
     attn_truncation_split_layer: int = 0,
     attn_truncation_tail_len: int = 0,
+    family_tokens: Optional[multi_task_rank_pb2.OneRankFamilyTokens] = None,
 ) -> model_pb2.ModelConfig:
     onerank = multi_task_rank_pb2.OneRankConfig()
     if scorer_type is not None:
@@ -137,6 +139,8 @@ def _model_config(
         onerank.scorer_hidden_dim = scorer_hidden_dim
     if task_bias_init is not None:
         onerank.task_bias_init.extend(task_bias_init)
+    if family_tokens is not None:
+        onerank.family_tokens.CopyFrom(family_tokens)
     if with_situation_discernment:
         onerank.situation_discernment.CopyFrom(
             multi_task_rank_pb2.OneRankSituationDiscernment(num_heads=2)
@@ -940,6 +944,100 @@ class DlrmHSTUOneRankTest(unittest.TestCase):
         model = _build_model(device=torch.device("cpu"))
         for layer in model._hstu_transducer._stu_module._stu_layers:
             self.assertEqual(layer._scaling_seqlen, 132)
+
+
+    _FAMILY_TOKENS = multi_task_rank_pb2.OneRankFamilyTokens(
+        # one family per candidate-group feature: item_video_id (16 dims),
+        # item_video_cat (16 dims)
+        feature_family_ids=[0, 1],
+        family_names=["video_id", "video_cat"],
+    )
+
+    # 100 history tokens + 8 candidates * (K + F) group rows: the block
+    # layout's inflated bound for the default test tasks and families.
+    _BLOCK_MAX_SEQ_LEN = 100 + 8 * (len(_TASK_NAMES) + 2)
+
+    def test_family_tokens_builds_the_block_layout(self) -> None:
+        """``family_tokens`` switches the trunk to ``[t_1..t_K, x^1..x^F]``.
+
+        The per-feature proto ids are expanded to per-dimension ids against
+        the candidate group's embedding dims, and the trunk's group size and
+        the scaling divisor follow ``K + F``.  Both block masks look ahead
+        inside the group, so every layer must request the noncausal lift.
+        """
+        model = _build_model(
+            device=torch.device("cpu"),
+            family_tokens=self._FAMILY_TOKENS,
+            max_seq_len=self._BLOCK_MAX_SEQ_LEN,
+        )
+        tokenizer = model._hstu_transducer._tokenizer
+        self.assertEqual(tokenizer.layout, LAYOUT_BLOCK)
+        self.assertEqual(tokenizer.group_size, len(_TASK_NAMES) + 2)
+        self.assertEqual(tokenizer.num_families, 2)
+        self.assertEqual(tokenizer.family_names, ["video_id", "video_cat"])
+        # Per-feature ids [0, 1] over dims [16, 16] -> families of 16 dims.
+        self.assertEqual(tokenizer._family_dims, [16, 16])
+        # max_seq_len bounds the *inflated* sequence (the group stride is
+        # now K + F, not K + 1); the divisor follows it verbatim.
+        for layer in model._hstu_transducer._stu_module._stu_layers:
+            self.assertEqual(layer._scaling_seqlen, self._BLOCK_MAX_SEQ_LEN)
+            self.assertTrue(layer.uses_noncausal_func_mask)
+
+    def test_family_tokens_single_family_spans_features(self) -> None:
+        """Ids [0, 0] make one 32-dim family spanning both features."""
+        model = _build_model(
+            device=torch.device("cpu"),
+            family_tokens=multi_task_rank_pb2.OneRankFamilyTokens(
+                feature_family_ids=[0, 0]
+            ),
+        )
+        tokenizer = model._hstu_transducer._tokenizer
+        self.assertEqual(tokenizer._family_dims, [32])
+        self.assertEqual(tokenizer.family_names, ["family_0"])
+
+    def test_family_tokens_id_count_must_match_features(self) -> None:
+        """One id per candidate-group feature; anything else is a typo."""
+        with self.assertRaisesRegex(ValueError, "sequence features"):
+            _build_model(
+                device=torch.device("cpu"),
+                family_tokens=multi_task_rank_pb2.OneRankFamilyTokens(
+                    feature_family_ids=[0]
+                ),
+            )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_family_tokens_train_one_step(self) -> None:
+        """End to end: raw candidate features reach the tokenizer, the
+        block groups flow through attention, and the family projections
+        receive gradients (a family whose ``W_f`` never trained would
+        silently reduce the probe to its task tokens).
+        """
+        device = torch.device("cuda")
+        model = _build_model(
+            device=device,
+            family_tokens=self._FAMILY_TOKENS,
+            max_seq_len=self._BLOCK_MAX_SEQ_LEN,
+        )
+        model.set_kernel(Kernel.PYTORCH)
+        wrapper = TrainWrapper(model, device=device).to(device)
+
+        tokenizer = wrapper.model._hstu_transducer._tokenizer
+        for f in range(tokenizer.num_families):
+            self.assertEqual(
+                tokenizer._buffers[f"_family_idx_{f}"].device.type,
+                "cuda",
+                msg=f"family index buffer {f} left behind on CPU",
+            )
+
+        total_loss, _ = wrapper(_build_batch(device=device))
+        self.assertTrue(torch.isfinite(total_loss))
+        total_loss.backward()
+
+        for f, proj in enumerate(tokenizer._family_projs):
+            grad = proj.weight.grad
+            self.assertIsNotNone(grad, msg=f"family {f} projection has no grad")
+            self.assertTrue(torch.isfinite(grad).all())
+        self.assertIsNotNone(tokenizer._task_tokens.grad)
 
     def test_runtime_rejects_inflated_sequences_above_max_seq_len(self) -> None:
         """Requests whose inflated sequence exceeds ``max_seq_len`` fail loudly.
